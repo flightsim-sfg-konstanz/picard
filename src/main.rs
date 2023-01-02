@@ -1,19 +1,91 @@
 use serialport::SerialPort;
-use simconnect;
+use simconnect_sdk::{Notification, SimConnect, SimConnectObject};
 use std::io::Write;
 use std::{
     io::{BufRead, BufReader},
     sync::{atomic::AtomicBool, mpsc},
     time::Duration,
 };
-use std::{mem, thread};
 
 /// The baud rate of the Arduino used for the serial connection.
 const BAUD_RATE: u32 = 115200;
 
+/// A data structure that will be used to receive data from SimConnect.
+/// See the documentation of `SimConnectObject` for more information on the arguments of the `simconnect` attribute.
+#[derive(Debug, Clone, SimConnectObject)]
+#[simconnect(period = "visual-frame", condition = "changed", interval = 5)]
+#[allow(dead_code)]
+struct AirplaneData {
+    #[simconnect(name = "GEAR CENTER POSITION", unit = "percent over 100")]
+    gear_center_position: f64,
+    #[simconnect(name = "GEAR LEFT POSITION", unit = "percent over 100")]
+    gear_left_position: f64,
+    #[simconnect(name = "GEAR RIGHT POSITION", unit = "percent over 100")]
+    gear_right_position: f64,
+
+    /// Parking brake indicator.
+    ///
+    /// WARNING: Must be the last entry in the struct due to a bug in the `simconnect-sdk` crate, otherwise the gear position values are interpreted false.
+    #[simconnect(name = "BRAKE PARKING INDICATOR")]
+    parking_brake_indicator: bool,
+}
+
 #[derive(Debug)]
-struct DataStruct {
-    gear_center_pos: f32,
+struct SimStatus {
+    parking_brake_indicator: bool,
+    gear_center_state: LandingGearStatus,
+    gear_left_state: LandingGearStatus,
+    gear_right_state: LandingGearStatus,
+}
+
+impl From<AirplaneData> for SimStatus {
+    fn from(value: AirplaneData) -> Self {
+        Self {
+            parking_brake_indicator: value.parking_brake_indicator,
+            gear_center_state: value.gear_center_position.into(),
+            gear_left_state: value.gear_left_position.into(),
+            gear_right_state: value.gear_left_position.into(),
+        }
+    }
+}
+
+impl SimStatus {
+    fn send(&self, tx: &mut Box<dyn SerialPort>) -> Result<(), std::io::Error> {
+        writeln!(tx, "PARKING_BRAKE:{}", self.parking_brake_indicator as i32)?;
+        writeln!(tx, "FRONT_GEAR_LED:{}", self.gear_center_state.as_int())?;
+        writeln!(tx, "LEFT_GEAR_LED:{}", self.gear_left_state.as_int())?;
+        writeln!(tx, "RIGHT_GEAR_LED:{}", self.gear_right_state.as_int())?;
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
+enum LandingGearStatus {
+    Unknown,
+    Up,
+    Down,
+}
+
+impl From<f64> for LandingGearStatus {
+    fn from(value: f64) -> Self {
+        if value == 0.0 {
+            Self::Up
+        } else if value == 1.0 {
+            Self::Down
+        } else {
+            Self::Unknown
+        }
+    }
+}
+
+impl LandingGearStatus {
+    fn as_int(&self) -> i32 {
+        match self {
+            LandingGearStatus::Up => 0,
+            LandingGearStatus::Down => 1,
+            LandingGearStatus::Unknown => 2,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -23,47 +95,31 @@ enum Event {
     /// Reset the connection to the Arduino
     Reset,
     Command(String),
+    Sim(SimStatus),
 }
 
-fn run_simconnect() {
-    let mut conn = simconnect::SimConnector::new();
-    conn.connect("FSSK EventSim Main Panel");
-    // Assign a sim variable to a client defined id
-    conn.add_data_definition(
-        0,
-        "GEAR CENTER POSITION",
-        "percent over 100",
-        simconnect::SIMCONNECT_DATATYPE_SIMCONNECT_DATATYPE_FLOAT32,
-        0,
-    );
-    conn.request_data_on_sim_object(
-        0,
-        0,
-        0,
-        simconnect::SIMCONNECT_PERIOD_SIMCONNECT_PERIOD_VISUAL_FRAME,
-        simconnect::SIMCONNECT_DATA_REQUEST_FLAG_CHANGED,
-        0,
-        3,
-        0,
-    ); //request_id, define_id, object_id (user), period, falgs, origin, interval, limit - tells simconnect to send data for the defined id and on the user aircraft
+fn run_simconnect(event_tx: mpsc::Sender<Event>) {
+    let mut client = SimConnect::new("FSSK EventSim Main Panel").unwrap();
 
     loop {
-        match conn.get_next_message() {
-            Ok(simconnect::DispatchResult::SimobjectData(data)) => unsafe {
-                match data.dwDefineID {
-                    0 => {
-                        #[allow(unaligned_references)]
-                        let sim_data: DataStruct = mem::transmute_copy(&data.dwData);
-                        println!("{:?}", sim_data.gear_center_pos);
-                    }
-                    _ => (),
-                }
-            },
+        let notification = client.get_next_dispatch().unwrap();
+
+        match notification {
+            Some(Notification::Open) => {
+                println!("Connection opened.");
+                // After the connection is successfully open, we register the struct
+                client.register_object::<AirplaneData>().unwrap();
+            }
+            Some(Notification::Object(data)) => {
+                event_tx
+                    .send(Event::Sim(AirplaneData::try_from(&data).unwrap().into()))
+                    .unwrap();
+            }
             _ => (),
         }
 
-        // Will use up lots of CPU if this is not included, as get_next_message() is non-blocking
-        thread::sleep(Duration::from_millis(1000 / 120));
+        // sleep for about a frame to reduce CPU usage
+        std::thread::sleep(std::time::Duration::from_millis(20));
     }
 }
 
@@ -114,7 +170,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Open serial port
     let mut port_tx = serialport::new(&port_path, BAUD_RATE)
         .timeout(Duration::from_millis(10))
-        .open_native()
+        .open()
         .expect("Failed to open port");
 
     // Serial reader thread
@@ -123,7 +179,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     std::thread::spawn(move || run_serial_reader(serial_event_tx, port_rx));
 
     // SimConnect thread
-    std::thread::spawn(run_simconnect);
+    let simconnect_event_tx = event_tx.clone();
+    std::thread::spawn(move || run_simconnect(simconnect_event_tx));
     // Periodic keepalive event thread
     let keepalive_event_tx = event_tx;
     std::thread::spawn(move || run_keepalive(keepalive_event_tx));
@@ -140,6 +197,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 *connected.get_mut() = true;
             }
             Event::Reset => *connected.get_mut() = false,
+            Event::Sim(simstate) => simstate.send(&mut port_tx)?,
             _ => {}
         }
     }
