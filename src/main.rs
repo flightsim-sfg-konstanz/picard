@@ -13,7 +13,7 @@ const BAUD_RATE: u32 = 115200;
 /// A data structure that will be used to receive data from SimConnect.
 /// See the documentation of `SimConnectObject` for more information on the arguments of the `simconnect` attribute.
 #[derive(Debug, Clone, SimConnectObject)]
-#[simconnect(period = "visual-frame", condition = "changed", interval = 5)]
+#[simconnect(period = "sim-frame", condition = "changed", interval = 50)]
 #[allow(dead_code)]
 struct AirplaneData {
     #[simconnect(name = "GEAR CENTER POSITION", unit = "percent over 100")]
@@ -119,7 +119,7 @@ fn run_simconnect(event_tx: mpsc::Sender<Event>) {
         }
 
         // sleep for about a frame to reduce CPU usage
-        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::thread::sleep(std::time::Duration::from_millis(10));
     }
 }
 
