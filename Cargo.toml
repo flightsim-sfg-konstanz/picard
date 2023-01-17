@@ -9,4 +9,4 @@ edition = "2021"
 env_logger = "0.10.0"
 log = "0.4"
 serialport = "4"
-simconnect-sdk = { path = "../simconnect-sdk-rs/simconnect-sdk", features = ["derive"] }
+simconnect-sdk = { git = "https://github.com/flightsim-sfg-konstanz/simconnect-sdk-rs.git", branch = "main", features = ["derive"] }

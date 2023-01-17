@@ -1,5 +1,6 @@
-use log::{error, info};
-use panel::run_panel;
+use log::error;
+use panel::EventSimPanel;
+use serialport::SerialPortType;
 use sim::{AircraftSimState, SimClientEvent, SimCommunicator};
 use std::sync::mpsc;
 use std::thread;
@@ -15,42 +16,79 @@ pub enum Event {
     SetPanel(AircraftSimState),
 }
 
-fn try_main(port_path: String) -> Result<(), Box<dyn std::error::Error>> {
+fn run(port: String) -> Result<(), Box<dyn std::error::Error>> {
     let (sim_tx, sim_rx) = mpsc::channel();
     let (hw_tx, hw_rx) = mpsc::channel();
 
-    let mut sim_communicator = SimCommunicator::new(sim_tx, hw_rx);
-    let sim_handle = thread::spawn(move || sim_communicator.run());
-    let panel_handle = thread::spawn(move || run_panel(&port_path, hw_tx, sim_rx));
+    let sim_handle = thread::spawn(move || SimCommunicator::new(sim_tx, hw_rx).run());
+    let panel_handle = thread::spawn(move || EventSimPanel::new(port, hw_tx, sim_rx).run());
 
     sim_handle
         .join()
         .expect("Couldn't join on the associated thread");
     panel_handle
         .join()
-        .expect("Couldn't join on the associated thread");
+        .expect("Couldn't join on the associated thread")?;
 
     Ok(())
+}
+
+/// List all available serial ports and their information.
+///
+/// Slightly adapted from https://github.com/serialport/serialport-rs/blob/main/examples/list_ports.rs.
+fn list_serialports() -> Result<(), Box<dyn std::error::Error>> {
+    let ports = serialport::available_ports()?;
+    match ports.len() {
+        0 => println!("No ports found."),
+        1 => println!("Found 1 port:"),
+        n => println!("Found {} ports:", n),
+    };
+    for p in ports {
+        println!("{}", p.port_name);
+        match p.port_type {
+            SerialPortType::UsbPort(info) => {
+                println!("    Type: USB");
+                println!("    VID:{:04x} PID:{:04x}", info.vid, info.pid);
+                println!(
+                    "    Serial Number: {}",
+                    info.serial_number.as_ref().map_or("", String::as_str)
+                );
+                println!(
+                    "    Manufacturer: {}",
+                    info.manufacturer.as_ref().map_or("", String::as_str)
+                );
+                println!(
+                    "    Product: {}",
+                    info.product.as_ref().map_or("", String::as_str)
+                );
+            }
+            SerialPortType::BluetoothPort => {
+                println!("    Type: Bluetooth");
+            }
+            SerialPortType::PciPort => {
+                println!("    Type: PCI");
+            }
+            SerialPortType::Unknown => {
+                println!("    Type: Unknown");
+            }
+        }
+    }
+    Ok(())
+}
+
+fn try_main() -> Result<(), Box<dyn std::error::Error>> {
+    match std::env::args().nth(1) {
+        Some(port) => run(port),
+        None => list_serialports(),
+    }
 }
 
 fn main() {
     // Setup logging output
     env_logger::init();
 
-    // Parse commandline arguments such as COM port
-    let mut args = std::env::args();
-    if args.len() < 2 {
-        // Print available serial ports
-        let ports = serialport::available_ports().expect("No ports found!");
-        for p in ports {
-            info!("{}", p.port_name);
-        }
-        return;
-    }
-    let port_path = args.nth(1).unwrap();
-
     // Run the application
-    if let Err(e) = try_main(port_path) {
-        error!("Fatal error: {}", e);
+    if let Err(e) = try_main() {
+        error!("{e}");
     }
 }

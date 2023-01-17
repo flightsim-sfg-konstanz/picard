@@ -1,6 +1,6 @@
 use std::{sync::mpsc, time::Duration};
 
-use log::{error, info};
+use log::{debug, error, info, warn};
 use serialport::SerialPort;
 use simconnect_sdk::{FlxClientEvent, Notification, SimConnect, SimConnectError, SimConnectObject};
 
@@ -153,15 +153,18 @@ impl SimCommunicator {
 
     pub fn run(&mut self) {
         loop {
-            info!("Attempting to connect via SimConnect");
+            debug!("Attempting to connect via SimConnect");
             match SimConnect::new("FSSK EventSim Main Panel") {
-                Ok(client) => {
-                    if let Err(e) = self.run_event_loop(client) {
-                        error!("SimConnect communication error: {:?}", e);
-                    }
-                }
+                Ok(client) => match self.run_event_loop(client) {
+                    // If we receive the exit signal, exit the thread
+                    Ok(true) => return,
+                    // Peaceful disconnect from simulator, reconnect later
+                    Ok(false) => {}
+                    // Got SimConnect error, notify user
+                    Err(e) => error!("SimConnect communication error: {:?}", e),
+                },
                 Err(e) => {
-                    error!("Failed to connect via SimConnect: {:?}", e);
+                    warn!("Failed to connect via SimConnect: {:?}", e);
                 }
             }
 
@@ -173,20 +176,20 @@ impl SimCommunicator {
         }
     }
 
-    fn run_event_loop(&mut self, mut client: SimConnect) -> Result<(), SimConnectError> {
+    fn run_event_loop(&mut self, mut client: SimConnect) -> Result<bool, SimConnectError> {
         loop {
             // Receive control messages if we are connected
             if self.connected {
                 match self.hw_rx.try_recv() {
                     Ok(Event::SetSimulator(event)) => client.transmit_event(event)?,
-                    Err(mpsc::TryRecvError::Disconnected) => panic!("fuck me"),
+                    Err(mpsc::TryRecvError::Disconnected) => return Ok(true),
                     _ => {}
                 }
             }
 
             match client.get_next_dispatch()? {
                 Some(Notification::Open) => {
-                    info!("SimConnect connection opened");
+                    info!("Connection with flight simulator established");
                     // After the connection is successfully open, we register the aircraft data struct
                     client.register_object::<AircraftSimData>()?;
                     // We register the events we want to send to the simulator
@@ -209,12 +212,12 @@ impl SimCommunicator {
                     self.connected = true;
                 }
                 Some(Notification::Quit) => {
-                    info!("SimConnect connection quit");
-                    return Ok(());
+                    info!("Disconnected from flight simulator");
+                    return Ok(false);
                 }
                 Some(Notification::Object(data)) => {
-                    let aircraft_state = AircraftSimData::try_from(&data).unwrap();
-                    info!("Received SimConnect aircraft state {:?}", aircraft_state);
+                    let aircraft_state = AircraftSimData::try_from(&data)?;
+                    debug!("Received SimConnect aircraft state {:?}", aircraft_state);
                     self.sim_tx
                         .send(Event::SetPanel(aircraft_state.into()))
                         .expect("Failed to send to the control thread");
