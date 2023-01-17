@@ -7,4 +7,4 @@ edition = "2021"
 
 [dependencies]
 serialport = "4"
-simconnect-sdk = { git = "https://github.com/mihai-dinculescu/simconnect-sdk-rs", branch = "main", features = ["derive"] }
+simconnect-sdk = { path = "../simconnect-sdk-rs/simconnect-sdk", features = ["derive"] }

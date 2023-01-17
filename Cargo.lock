@@ -343,7 +343,6 @@ checksum = "43b2853a4d09f215c24cc5489c992ce46052d359b5109343cbafbf26bc62f8a3"
 [[package]]
 name = "simconnect-sdk"
 version = "0.2.1"
-source = "git+https://github.com/mihai-dinculescu/simconnect-sdk-rs?branch=main#9f569d49fabf05d515735dcf188a24fe8f8c515c"
 dependencies = [
  "bindgen",
  "num_enum",
@@ -355,7 +354,6 @@ dependencies = [
 [[package]]
 name = "simconnect-sdk-derive"
 version = "0.2.1"
-source = "git+https://github.com/mihai-dinculescu/simconnect-sdk-rs?branch=main#9f569d49fabf05d515735dcf188a24fe8f8c515c"
 dependencies = [
  "once_cell",
  "proc-macro2",

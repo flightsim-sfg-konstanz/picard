@@ -1,5 +1,5 @@
 use serialport::SerialPort;
-use simconnect_sdk::{Notification, SimConnect, SimConnectObject};
+use simconnect_sdk::{FlxClientEvent, Notification, SimConnect, SimConnectObject};
 use std::io::Write;
 use std::{
     io::{BufRead, BufReader},
@@ -98,6 +98,59 @@ enum Event {
     Sim(SimStatus),
 }
 
+#[derive(Debug, Clone, Copy)]
+#[repr(u32)]
+enum SimClientEvent {
+    LandingLightsOn,
+    LandingLightsOff,
+    TaxiLightsOn,
+    TaxiLightsOff,
+    StrobeLightsOn,
+    StrobeLightsOff,
+    NavLightsOn,
+    NavLightsOff,
+    FlapsUp,
+    FlapsDown,
+    ParkingBrakeOn,
+    ParkingBrakeOff,
+    LandingGearUp,
+    LandingGearDown,
+}
+
+impl FlxClientEvent for SimClientEvent {
+    fn event_id(&self) -> u32 {
+        *self as u32
+    }
+
+    fn event_name(&self) -> *const std::ffi::c_char {
+        (match self {
+            SimClientEvent::LandingLightsOn => "LANDING_LIGHTS_ON\0",
+            SimClientEvent::LandingLightsOff => "LANDING_LIGHTS_OFF\0",
+            SimClientEvent::TaxiLightsOn => "TAXI_LIGHTS_ON\0",
+            SimClientEvent::TaxiLightsOff => "TAXI_LIGHTS_OFF\0",
+            SimClientEvent::StrobeLightsOn => "STROBES_ON\0",
+            SimClientEvent::StrobeLightsOff => "STROBES_OFF\0",
+            SimClientEvent::NavLightsOn => "NAV_LIGHTS_ON\0",
+            SimClientEvent::NavLightsOff => "NAV_LIGHTS_OFF\0",
+            SimClientEvent::FlapsUp => "FLAPS_DECR\0",
+            SimClientEvent::FlapsDown => "FLAPS_INCR\0",
+            SimClientEvent::ParkingBrakeOn => "PARKING_BRAKE_SET\0",
+            SimClientEvent::ParkingBrakeOff => "PARKING_BRAKE_SET\0",
+            SimClientEvent::LandingGearUp => "GEAR_UP\0",
+            SimClientEvent::LandingGearDown => "GEAR_DOWN\0",
+        })
+        .as_ptr() as *const std::ffi::c_char
+    }
+
+    fn data(&self) -> u32 {
+        match self {
+            SimClientEvent::ParkingBrakeOn => 1,
+            SimClientEvent::ParkingBrakeOff => 0,
+            _ => 0,
+        }
+    }
+}
+
 fn run_simconnect(event_tx: mpsc::Sender<Event>) {
     let mut client = SimConnect::new("FSSK EventSim Main Panel").unwrap();
 
@@ -188,6 +241,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Initiate handshake with the Arduino
     writeln!(port_tx, "SYN")?;
 
+    let client = SimConnect::new("FSSK EventSim Main Panel 2").unwrap();
+    client.map_client_event_to_sim_event(SimClientEvent::LandingLightsOn)?;
+    client.map_client_event_to_sim_event(SimClientEvent::LandingLightsOff)?;
+    client.map_client_event_to_sim_event(SimClientEvent::TaxiLightsOn)?;
+    client.map_client_event_to_sim_event(SimClientEvent::TaxiLightsOff)?;
+    client.map_client_event_to_sim_event(SimClientEvent::StrobeLightsOn)?;
+    client.map_client_event_to_sim_event(SimClientEvent::StrobeLightsOff)?;
+    client.map_client_event_to_sim_event(SimClientEvent::NavLightsOn)?;
+    client.map_client_event_to_sim_event(SimClientEvent::NavLightsOff)?;
+    client.map_client_event_to_sim_event(SimClientEvent::FlapsUp)?;
+    client.map_client_event_to_sim_event(SimClientEvent::FlapsDown)?;
+    client.map_client_event_to_sim_event(SimClientEvent::ParkingBrakeOn)?;
+    client.map_client_event_to_sim_event(SimClientEvent::ParkingBrakeOff)?;
+    client.map_client_event_to_sim_event(SimClientEvent::LandingGearUp)?;
+    client.map_client_event_to_sim_event(SimClientEvent::LandingGearDown)?;
+
     for event in event_rx {
         println!("Received event {:?}", &event);
         match event {
@@ -198,6 +267,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             Event::Reset => *connected.get_mut() = false,
             Event::Sim(simstate) => simstate.send(&mut port_tx)?,
+            Event::Command(cmd) => match cmd.as_str() {
+                "MISC1:0" => client.transmit_event(SimClientEvent::TaxiLightsOff)?,
+                "MISC1:1" => client.transmit_event(SimClientEvent::TaxiLightsOn)?,
+                "MISC2:0" => client.transmit_event(SimClientEvent::LandingLightsOff)?,
+                "MISC2:1" => client.transmit_event(SimClientEvent::LandingLightsOn)?,
+                "MISC3:0" => client.transmit_event(SimClientEvent::NavLightsOff)?,
+                "MISC3:1" => client.transmit_event(SimClientEvent::NavLightsOn)?,
+                "MISC4:0" => client.transmit_event(SimClientEvent::StrobeLightsOff)?,
+                "MISC4:1" => client.transmit_event(SimClientEvent::StrobeLightsOn)?,
+                "FLAPS_UP" => client.transmit_event(SimClientEvent::FlapsUp)?,
+                "FLAPS_DN" => client.transmit_event(SimClientEvent::FlapsDown)?,
+                "PARKING_BRAKE:0" => client.transmit_event(SimClientEvent::ParkingBrakeOff)?,
+                "PARKING_BRAKE:1" => client.transmit_event(SimClientEvent::ParkingBrakeOn)?,
+                "LANDING_GEAR:0" => client.transmit_event(SimClientEvent::LandingGearUp)?,
+                "LANDING_GEAR:1" => client.transmit_event(SimClientEvent::LandingGearDown)?,
+                _ => {}
+            },
             _ => {}
         }
     }
