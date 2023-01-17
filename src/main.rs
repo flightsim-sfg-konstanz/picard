@@ -1,6 +1,9 @@
+use log::{error, info};
 use serialport::SerialPort;
-use simconnect_sdk::{FlxClientEvent, Notification, SimConnect, SimConnectObject};
+use simconnect_sdk::{FlxClientEvent, Notification, SimConnect, SimConnectError, SimConnectObject};
 use std::io::Write;
+use std::thread;
+use std::time::Instant;
 use std::{
     io::{BufRead, BufReader},
     sync::mpsc,
@@ -14,7 +17,7 @@ const BAUD_RATE: u32 = 115200;
 /// See the documentation of `SimConnectObject` for more information on the arguments of the `simconnect` attribute.
 #[derive(Debug, Clone, SimConnectObject)]
 #[simconnect(period = "sim-frame", condition = "changed")]
-struct AirplaneSimData {
+struct AircraftSimData {
     #[simconnect(name = "GEAR CENTER POSITION", unit = "percent over 100")]
     gear_center_position: f64,
     #[simconnect(name = "GEAR LEFT POSITION", unit = "percent over 100")]
@@ -38,8 +41,8 @@ struct AircraftSimState {
     gear_right_state: LandingGearStatus,
 }
 
-impl From<AirplaneSimData> for AircraftSimState {
-    fn from(value: AirplaneSimData) -> Self {
+impl From<AircraftSimData> for AircraftSimState {
+    fn from(value: AircraftSimData) -> Self {
         Self {
             parking_brake_indicator: value.parking_brake_indicator,
             gear_center_state: value.gear_center_position.into(),
@@ -90,14 +93,10 @@ impl LandingGearStatus {
 
 #[derive(Debug)]
 enum Event {
-    Keepalive,
-    SynAck,
-    /// Reset the connection to the Arduino.
-    Disconnect,
-    /// The hardware state of the panel was changed.
-    PanelChange(String),
-    /// The simulator state changed.
-    SimChange(AircraftSimState),
+    /// The hardware state of the panel changed.
+    SetSimulator(SimClientEvent),
+    /// The simulator aircraft state changed.
+    SetPanel(AircraftSimState),
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -153,155 +152,245 @@ impl FlxClientEvent for SimClientEvent {
     }
 }
 
-fn run_simconnect(event_tx: mpsc::Sender<Event>) {
-    let mut client = SimConnect::new("FSSK EventSim Main Panel").unwrap();
+struct SimCommunicator {
+    connected: bool,
+    sim_tx: mpsc::Sender<Event>,
+    hw_rx: mpsc::Receiver<Event>,
+}
+
+impl SimCommunicator {
+    pub fn new(sim_tx: mpsc::Sender<Event>, hw_rx: mpsc::Receiver<Event>) -> Self {
+        Self {
+            connected: false,
+            sim_tx,
+            hw_rx,
+        }
+    }
+
+    pub fn run(&mut self) {
+        loop {
+            info!("Attempting to connect via SimConnect");
+            match SimConnect::new("FSSK EventSim Main Panel") {
+                Ok(client) => {
+                    if let Err(e) = self.run_event_loop(client) {
+                        error!("SimConnect communication error: {:?}", e);
+                    }
+                }
+                Err(e) => {
+                    error!("Failed to connect via SimConnect: {:?}", e);
+                }
+            }
+
+            // We are now disconnected
+            self.connected = false;
+
+            // Wait before reconnecting
+            std::thread::sleep(Duration::from_secs(5));
+        }
+    }
+
+    fn run_event_loop(&mut self, mut client: SimConnect) -> Result<(), SimConnectError> {
+        loop {
+            // Receive control messages if we are connected
+            if self.connected {
+                match self.hw_rx.try_recv() {
+                    Ok(Event::SetSimulator(event)) => client.transmit_event(event)?,
+                    Err(mpsc::TryRecvError::Disconnected) => panic!("fuck me"),
+                    _ => {}
+                }
+            }
+
+            match client.get_next_dispatch()? {
+                Some(Notification::Open) => {
+                    info!("SimConnect connection opened");
+                    // After the connection is successfully open, we register the aircraft data struct
+                    client.register_object::<AircraftSimData>()?;
+                    // We register the events we want to send to the simulator
+                    client.map_client_event_to_sim_event(SimClientEvent::LandingLightsOn)?;
+                    client.map_client_event_to_sim_event(SimClientEvent::LandingLightsOff)?;
+                    client.map_client_event_to_sim_event(SimClientEvent::TaxiLightsOn)?;
+                    client.map_client_event_to_sim_event(SimClientEvent::TaxiLightsOff)?;
+                    client.map_client_event_to_sim_event(SimClientEvent::StrobeLightsOn)?;
+                    client.map_client_event_to_sim_event(SimClientEvent::StrobeLightsOff)?;
+                    client.map_client_event_to_sim_event(SimClientEvent::NavLightsOn)?;
+                    client.map_client_event_to_sim_event(SimClientEvent::NavLightsOff)?;
+                    client.map_client_event_to_sim_event(SimClientEvent::FlapsUp)?;
+                    client.map_client_event_to_sim_event(SimClientEvent::FlapsDown)?;
+                    client.map_client_event_to_sim_event(SimClientEvent::ParkingBrakeOn)?;
+                    client.map_client_event_to_sim_event(SimClientEvent::ParkingBrakeOff)?;
+                    client.map_client_event_to_sim_event(SimClientEvent::LandingGearUp)?;
+                    client.map_client_event_to_sim_event(SimClientEvent::LandingGearDown)?;
+
+                    // We are now successfully connected
+                    self.connected = true;
+                }
+                Some(Notification::Quit) => {
+                    info!("SimConnect connection quit");
+                    return Ok(());
+                }
+                Some(Notification::Object(data)) => {
+                    let aircraft_state = AircraftSimData::try_from(&data).unwrap();
+                    info!("Received SimConnect aircraft state {:?}", aircraft_state);
+                    self.sim_tx
+                        .send(Event::SetPanel(aircraft_state.into()))
+                        .expect("Failed to send to the control thread");
+                }
+                Some(unkn) => {
+                    dbg!(unkn);
+                }
+                _ => {}
+            }
+
+            // Sleep for about a frame to reduce CPU usage
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+}
+
+fn run_panel(port_path: &str, hw_tx: mpsc::Sender<Event>, sim_rx: mpsc::Receiver<Event>) {
+    // Open serial port
+    info!("Attempting to connect to serial port {}", port_path);
+    let mut serial = serialport::new(port_path, BAUD_RATE)
+        .timeout(Duration::from_millis(10))
+        .open()
+        .expect("Failed to open port");
+
+    let reader = BufReader::with_capacity(1, serial.try_clone().unwrap());
+    let mut aircraft_sim_state = Option::None;
+    let mut line_reader = reader.lines();
+    let mut et = Instant::now();
+    let mut connected = false;
+
+    // Initiate handshake with the Arduino
+    writeln!(serial, "SYN").unwrap();
 
     loop {
-        let notification = client.get_next_dispatch().unwrap();
-
-        match notification {
-            Some(Notification::Open) => {
-                println!("Connected to flight simulator via SimConnect");
-                // After the connection is successfully open, we register the struct
-                client.register_object::<AirplaneSimData>().unwrap();
+        // Receive control messages
+        if connected {
+            match sim_rx.try_recv() {
+                Ok(Event::SetPanel(state)) => {
+                    if aircraft_sim_state
+                        .map(|old_state| old_state != state)
+                        .unwrap_or(true)
+                    {
+                        state.send_state(&mut serial).unwrap();
+                    }
+                    aircraft_sim_state = Some(state);
+                }
+                Err(mpsc::TryRecvError::Disconnected) => panic!("fuck me"),
+                _ => {}
             }
-            Some(Notification::Object(data)) => {
-                let airplane_state = AirplaneSimData::try_from(&data).unwrap();
-                dbg!(&airplane_state);
-                event_tx
-                    .send(Event::SimChange(airplane_state.into()))
-                    .unwrap();
-            }
-            _ => (),
         }
 
-        // Sleep for about a frame to reduce CPU usage
-        std::thread::sleep(std::time::Duration::from_millis(10));
-    }
-}
-
-fn run_keepalive(tx: mpsc::Sender<Event>) {
-    loop {
-        tx.send(Event::Keepalive)
-            .expect("Failed to send keepalive event");
-        std::thread::sleep(Duration::from_millis(500));
-    }
-}
-
-fn run_serial_reader(event_tx: mpsc::Sender<Event>, serial_rx: Box<dyn SerialPort>) {
-    let reader = BufReader::with_capacity(1, serial_rx);
-    for line in reader.lines() {
-        match line {
-            Ok(command) => match command.as_str() {
-                "SYN|ACK" => event_tx.send(Event::SynAck).unwrap(),
-                "RST" => event_tx.send(Event::Disconnect).unwrap(),
-                _ => event_tx.send(Event::PanelChange(command)).unwrap(),
-            },
-            Err(e) => {
-                if e.kind() != std::io::ErrorKind::TimedOut {
-                    println!("{:?}", e)
+        // Read messages from serial port
+        if let Some(msg) = line_reader.next() {
+            if let Ok(msg) = &msg {
+                info!("Serial port received: {:?}", msg);
+            };
+            match msg.as_deref() {
+                Ok("SYN|ACK") => {
+                    writeln!(serial, "ACK").unwrap();
+                    info!("Connected with panel established via {}", port_path);
+                    connected = true;
+                }
+                Ok("RST") => {
+                    connected = false;
+                    drop(hw_tx);
+                    panic!("panel closed connection");
+                }
+                Ok(cmd) => match cmd {
+                    "MISC1:0" => hw_tx
+                        .send(Event::SetSimulator(SimClientEvent::TaxiLightsOff))
+                        .unwrap(),
+                    "MISC1:1" => hw_tx
+                        .send(Event::SetSimulator(SimClientEvent::TaxiLightsOn))
+                        .unwrap(),
+                    "MISC2:0" => hw_tx
+                        .send(Event::SetSimulator(SimClientEvent::LandingLightsOff))
+                        .unwrap(),
+                    "MISC2:1" => hw_tx
+                        .send(Event::SetSimulator(SimClientEvent::LandingLightsOn))
+                        .unwrap(),
+                    "MISC3:0" => hw_tx
+                        .send(Event::SetSimulator(SimClientEvent::NavLightsOff))
+                        .unwrap(),
+                    "MISC3:1" => hw_tx
+                        .send(Event::SetSimulator(SimClientEvent::NavLightsOn))
+                        .unwrap(),
+                    "MISC4:0" => hw_tx
+                        .send(Event::SetSimulator(SimClientEvent::StrobeLightsOff))
+                        .unwrap(),
+                    "MISC4:1" => hw_tx
+                        .send(Event::SetSimulator(SimClientEvent::StrobeLightsOn))
+                        .unwrap(),
+                    "FLAPS_UP" => hw_tx
+                        .send(Event::SetSimulator(SimClientEvent::FlapsUp))
+                        .unwrap(),
+                    "FLAPS_DN" => hw_tx
+                        .send(Event::SetSimulator(SimClientEvent::FlapsDown))
+                        .unwrap(),
+                    "PARKING_BRAKE:0" => {
+                        hw_tx
+                            .send(Event::SetSimulator(SimClientEvent::ParkingBrakeOff))
+                            .unwrap();
+                    }
+                    "PARKING_BRAKE:1" => {
+                        hw_tx
+                            .send(Event::SetSimulator(SimClientEvent::ParkingBrakeOn))
+                            .unwrap();
+                    }
+                    "LANDING_GEAR:0" => {
+                        hw_tx
+                            .send(Event::SetSimulator(SimClientEvent::LandingGearUp))
+                            .unwrap();
+                    }
+                    "LANDING_GEAR:1" => {
+                        hw_tx
+                            .send(Event::SetSimulator(SimClientEvent::LandingGearDown))
+                            .unwrap();
+                    }
+                    _ => {}
+                },
+                Err(e) => {
+                    if e.kind() != std::io::ErrorKind::TimedOut {
+                        info!("{:?}", e)
+                    }
                 }
             }
         }
+
+        // Send keepalive packets
+        let now = Instant::now();
+        if now > et + Duration::from_millis(500) {
+            writeln!(serial, "PING").unwrap();
+            et = now;
+        }
     }
-    println!("Serial thread exited");
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    env_logger::init();
+
     let mut args = std::env::args();
     if args.len() < 2 {
         // Print available serial ports
         let ports = serialport::available_ports().expect("No ports found!");
         for p in ports {
-            println!("{}", p.port_name);
+            info!("{}", p.port_name);
         }
         return Ok(());
     }
     let port_path = args.nth(1).unwrap();
 
-    let mut connected = false;
+    let (sim_tx, sim_rx) = mpsc::channel();
+    let (hw_tx, hw_rx) = mpsc::channel();
 
-    let (event_tx, event_rx) = std::sync::mpsc::channel();
+    let mut sim_communicator = SimCommunicator::new(sim_tx, hw_rx);
+    let sim_handle = thread::spawn(move || sim_communicator.run());
+    let panel_handle = thread::spawn(move || run_panel(&port_path, hw_tx, sim_rx));
 
-    println!("Connecting to port {}", port_path);
-
-    // Open serial port
-    let mut port_tx = serialport::new(&port_path, BAUD_RATE)
-        .timeout(Duration::from_millis(10))
-        .open()
-        .expect("Failed to open port");
-
-    // Serial reader thread
-    let serial_event_tx = event_tx.clone();
-    let port_rx = port_tx.try_clone()?;
-    std::thread::spawn(move || run_serial_reader(serial_event_tx, port_rx));
-
-    // SimConnect thread
-    let simconnect_event_tx = event_tx.clone();
-    std::thread::spawn(move || run_simconnect(simconnect_event_tx));
-    // Periodic keepalive event thread
-    let keepalive_event_tx = event_tx;
-    std::thread::spawn(move || run_keepalive(keepalive_event_tx));
-
-    // Initiate handshake with the Arduino
-    writeln!(port_tx, "SYN")?;
-
-    let client = SimConnect::new("FSSK EventSim Main Panel 2").unwrap();
-    client.map_client_event_to_sim_event(SimClientEvent::LandingLightsOn)?;
-    client.map_client_event_to_sim_event(SimClientEvent::LandingLightsOff)?;
-    client.map_client_event_to_sim_event(SimClientEvent::TaxiLightsOn)?;
-    client.map_client_event_to_sim_event(SimClientEvent::TaxiLightsOff)?;
-    client.map_client_event_to_sim_event(SimClientEvent::StrobeLightsOn)?;
-    client.map_client_event_to_sim_event(SimClientEvent::StrobeLightsOff)?;
-    client.map_client_event_to_sim_event(SimClientEvent::NavLightsOn)?;
-    client.map_client_event_to_sim_event(SimClientEvent::NavLightsOff)?;
-    client.map_client_event_to_sim_event(SimClientEvent::FlapsUp)?;
-    client.map_client_event_to_sim_event(SimClientEvent::FlapsDown)?;
-    client.map_client_event_to_sim_event(SimClientEvent::ParkingBrakeOn)?;
-    client.map_client_event_to_sim_event(SimClientEvent::ParkingBrakeOff)?;
-    client.map_client_event_to_sim_event(SimClientEvent::LandingGearUp)?;
-    client.map_client_event_to_sim_event(SimClientEvent::LandingGearDown)?;
-
-    let mut aircraft_sim_state = Option::None;
-
-    for event in event_rx {
-        println!("Received event {:?}", &event);
-        match event {
-            Event::Keepalive if connected => writeln!(port_tx, "PING")?,
-            Event::SynAck => {
-                writeln!(port_tx, "ACK")?;
-                connected = true;
-            }
-            Event::Disconnect => connected = false,
-            Event::SimChange(state) => {
-                if aircraft_sim_state
-                    .map(|old_state| old_state != state)
-                    .unwrap_or_default()
-                {
-                    state.send_state(&mut port_tx)?;
-                }
-                aircraft_sim_state = Some(state);
-            }
-            Event::PanelChange(cmd) => match cmd.as_str() {
-                "MISC1:0" => client.transmit_event(SimClientEvent::TaxiLightsOff)?,
-                "MISC1:1" => client.transmit_event(SimClientEvent::TaxiLightsOn)?,
-                "MISC2:0" => client.transmit_event(SimClientEvent::LandingLightsOff)?,
-                "MISC2:1" => client.transmit_event(SimClientEvent::LandingLightsOn)?,
-                "MISC3:0" => client.transmit_event(SimClientEvent::NavLightsOff)?,
-                "MISC3:1" => client.transmit_event(SimClientEvent::NavLightsOn)?,
-                "MISC4:0" => client.transmit_event(SimClientEvent::StrobeLightsOff)?,
-                "MISC4:1" => client.transmit_event(SimClientEvent::StrobeLightsOn)?,
-                "FLAPS_UP" => client.transmit_event(SimClientEvent::FlapsUp)?,
-                "FLAPS_DN" => client.transmit_event(SimClientEvent::FlapsDown)?,
-                "PARKING_BRAKE:0" => client.transmit_event(SimClientEvent::ParkingBrakeOff)?,
-                "PARKING_BRAKE:1" => client.transmit_event(SimClientEvent::ParkingBrakeOn)?,
-                "LANDING_GEAR:0" => client.transmit_event(SimClientEvent::LandingGearUp)?,
-                "LANDING_GEAR:1" => client.transmit_event(SimClientEvent::LandingGearDown)?,
-                _ => {}
-            },
-            _ => {}
-        }
-    }
+    sim_handle.join().unwrap();
+    panel_handle.join().unwrap();
 
     Ok(())
 }
