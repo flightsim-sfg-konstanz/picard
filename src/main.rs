@@ -2,7 +2,7 @@ use log::{debug, error};
 use panel::EventSimPanel;
 use sim::{AircraftSimState, SimClientEvent, SimCommunicator};
 use std::sync::mpsc;
-use std::{fs, thread};
+use std::{process, thread};
 
 use crate::config::Config;
 
@@ -18,9 +18,9 @@ pub enum Event {
     SetPanel(AircraftSimState),
 }
 
-fn try_main() -> Result<(), Box<dyn std::error::Error>> {
-    let config: Config = toml::from_str(&fs::read_to_string("config.toml")?)?;
+fn try_main(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     debug!("Using config {:?}", config);
+
     let eventsim_port = config
         .eventsim_port()
         .ok_or("EventSim port unspecified in config")?;
@@ -43,11 +43,18 @@ fn try_main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn main() {
-    // Setup logging output
-    env_logger::init();
+    // Parse the app configuration
+    let config = Config::from_file("config.toml").unwrap_or_else(|e| {
+        eprintln!("{e}");
+        process::exit(1)
+    });
+
+    // Override the log level based on the configuration
+    let level = config.log_level.as_str();
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(level)).init();
 
     // Run the application
-    if let Err(e) = try_main() {
+    if let Err(e) = try_main(config) {
         error!("{e}");
     }
 }

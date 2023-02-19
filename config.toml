@@ -1,2 +1,4 @@
+log_level = "info"
+
 [panels.eventsim]
 port = "COM4"
