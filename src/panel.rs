@@ -1,6 +1,7 @@
 use core::fmt;
 use log::{debug, info};
 use std::io::Write;
+use std::thread;
 use std::time::Instant;
 use std::{
     io::{BufRead, BufReader},
@@ -93,6 +94,11 @@ impl EventSimPanel {
             .timeout(Duration::from_millis(10))
             .open()
             .map_err(|e| PanelError::SerialOpen(self.port_path.clone(), e))?;
+
+        // Reset device
+        serial.write_data_terminal_ready(true)?;
+        // Wait for device to finish resetting
+        thread::sleep(Duration::from_millis(2000));
 
         let reader = BufReader::with_capacity(1, serial.try_clone()?);
         let mut line_reader = reader.lines();

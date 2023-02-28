@@ -32,12 +32,12 @@ fn try_main(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     let panel_handle =
         thread::spawn(move || EventSimPanel::new(eventsim_port, hw_tx, sim_rx).run());
 
-    sim_handle
-        .join()
-        .expect("Couldn't join on the associated thread");
     panel_handle
         .join()
         .expect("Couldn't join on the associated thread")?;
+    sim_handle
+        .join()
+        .expect("Couldn't join on the associated thread");
 
     Ok(())
 }
