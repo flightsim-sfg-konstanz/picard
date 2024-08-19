@@ -1,13 +1,14 @@
 use log::{debug, error};
-use panel::EventSimPanel;
 use sim::{AircraftSimState, SimClientEvent, SimCommunicator};
 use std::sync::mpsc;
 use std::{process, thread};
 
 use crate::config::Config;
+use crate::panels::eventsim::EventSimPanel;
 
 mod config;
 mod panel;
+mod panels;
 mod sim;
 
 #[derive(Debug)]
