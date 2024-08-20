@@ -21,9 +21,7 @@ pub enum Event {
     SetPanel(AircraftSimState),
 }
 
-fn try_main(config: Config) -> Result<(), Box<dyn std::error::Error>> {
-    debug!("Using config {:?}", config);
-
+fn run(config: Config) {
     // Channel to transmit from hardware panels to the SimConnect client
     let (hw_tx, hw_rx) = mpsc::channel();
 
@@ -46,22 +44,22 @@ fn try_main(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         sim_txs.push(sim_tx);
     };
 
-    // Start panel threads
-    let mut panel_handles = Vec::new();
+    // Start threads
+    let mut handles = Vec::new();
     for mut panel in panels {
-        panel_handles.push(thread::spawn(move || panel.run()));
+        handles.push(thread::spawn(move || {
+            if let Err(e) = panel.run() {
+                error!("{e}");
+            }
+        }));
     }
-    // Start simconnect thread
-    let sim_handle = thread::spawn(move || SimCommunicator::new(sim_txs, hw_rx).run());
+    handles.push(thread::spawn(move || {
+        SimCommunicator::new(sim_txs, hw_rx).run()
+    }));
 
-    for handle in panel_handles {
-        handle.join().expect("Could not join on panel thread")?
+    for handle in handles {
+        let _ = handle.join();
     }
-    sim_handle
-        .join()
-        .expect("Couldn't join on the associated thread");
-
-    Ok(())
 }
 
 fn main() {
@@ -70,13 +68,12 @@ fn main() {
         eprintln!("{e}");
         process::exit(1)
     });
+    debug!("Using config {:?}", config);
 
     // Override the log level based on the configuration
     let level = config.log_level.as_str();
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(level)).init();
 
     // Run the application
-    if let Err(e) = try_main(config) {
-        error!("{e}");
-    }
+    run(config);
 }
