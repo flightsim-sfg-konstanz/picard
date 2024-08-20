@@ -1,4 +1,7 @@
 log_level = "info"
 
 [panels.eventsim]
-port = "COM4"
+port = "COM3"
+
+[panels.airspeedindicator]
+port = "COM5"

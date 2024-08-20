@@ -1,5 +1,6 @@
 use log::debug;
 use log::info;
+use serialport::SerialPort;
 use std::io::BufRead;
 use std::io::BufReader;
 use std::sync::mpsc;
@@ -7,6 +8,7 @@ use std::thread;
 use std::time::Duration;
 use std::time::Instant;
 
+use crate::panel::Panel;
 use crate::panel::PanelError;
 use crate::sim::AircraftSimState;
 use crate::sim::SimClientEvent;
@@ -18,39 +20,24 @@ const BAUD_RATE: u32 = 115200;
 /// Represents the EventSim Main Panel and holds all state and information.
 #[derive(Debug)]
 pub struct EventSimPanel {
-    pub(crate) connected: bool,
-    pub(crate) hw_tx: mpsc::Sender<Event>,
-    pub(crate) sim_rx: mpsc::Receiver<Event>,
-    pub(crate) port_path: String,
-    pub(crate) aircraft_sim_state: Option<AircraftSimState>,
+    port: String,
+    connected: bool,
+    hw_tx: mpsc::Sender<Event>,
+    sim_rx: mpsc::Receiver<Event>,
+    aircraft_sim_state: Option<AircraftSimState>,
 }
 
-impl EventSimPanel {
-    /// Create a new panel instance.
-    pub fn new(
-        port_path: String,
-        hw_tx: mpsc::Sender<Event>,
-        sim_rx: mpsc::Receiver<Event>,
-    ) -> Self {
-        Self {
-            connected: false,
-            hw_tx,
-            sim_rx,
-            port_path,
-            aircraft_sim_state: None,
-        }
-    }
-
+impl Panel for EventSimPanel {
     /// Connect to the panel and run an event loop.
-    pub fn run(&mut self) -> Result<(), PanelError> {
+    fn run(&mut self) -> Result<(), PanelError> {
         debug!(
             "Attempting to connect to panel on serial port {}",
-            self.port_path
+            self.port
         );
-        let mut serial = serialport::new(&self.port_path, BAUD_RATE)
+        let mut serial = serialport::new(&self.port, BAUD_RATE)
             .timeout(Duration::from_millis(10))
             .open()
-            .map_err(|e| PanelError::SerialOpen(self.port_path.clone(), e))?;
+            .map_err(|e| PanelError::SerialOpen(self.port.clone(), e))?;
 
         // Reset device
         serial.write_data_terminal_ready(true)?;
@@ -77,7 +64,7 @@ impl EventSimPanel {
                             .map(|old_state| old_state != &state)
                             .unwrap_or(true)
                         {
-                            state.send_state(&mut serial)?;
+                            send_state(&state, &mut serial)?;
                         }
                         self.aircraft_sim_state = Some(state);
                     }
@@ -95,7 +82,10 @@ impl EventSimPanel {
                     Ok(msg) => match msg.as_str() {
                         "SYN|ACK" => {
                             writeln!(serial, "ACK")?;
-                            info!("Connection with panel established via {}", self.port_path);
+                            info!(
+                                "Connection with EventSim panel established via {}",
+                                self.port
+                            );
                             self.connected = true;
                         }
                         "RST" => return Err(PanelError::Disconnect),
@@ -118,8 +108,25 @@ impl EventSimPanel {
             }
         }
     }
+}
 
-    pub(crate) fn handle_serial_command(&self, cmd: &str) {
+impl EventSimPanel {
+    /// Create a new panel instance.
+    pub fn new(
+        port: impl AsRef<str>,
+        hw_tx: mpsc::Sender<Event>,
+        sim_rx: mpsc::Receiver<Event>,
+    ) -> Self {
+        Self {
+            connected: false,
+            hw_tx,
+            sim_rx,
+            port: port.as_ref().into(),
+            aircraft_sim_state: None,
+        }
+    }
+
+    fn handle_serial_command(&self, cmd: &str) {
         debug!("Serial port received command: {:?}", cmd);
         let event = match cmd {
             "MISC1:0" => SimClientEvent::TaxiLightsOff,
@@ -142,4 +149,15 @@ impl EventSimPanel {
             .send(Event::SetSimulator(event))
             .expect("SimConnect thread offline");
     }
+}
+
+fn send_state(
+    state: &AircraftSimState,
+    tx: &mut Box<dyn SerialPort>,
+) -> Result<(), std::io::Error> {
+    writeln!(tx, "PARKING_BRAKE:{}", state.parking_brake_indicator as i32)?;
+    writeln!(tx, "FRONT_GEAR_LED:{}", state.gear_center_state.as_int())?;
+    writeln!(tx, "LEFT_GEAR_LED:{}", state.gear_left_state.as_int())?;
+    writeln!(tx, "RIGHT_GEAR_LED:{}", state.gear_right_state.as_int())?;
+    Ok(())
 }

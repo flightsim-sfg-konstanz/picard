@@ -20,6 +20,12 @@ impl Config {
     pub fn eventsim_port(&self) -> Option<String> {
         self.panels.get("eventsim").map(|panel| panel.port.clone())
     }
+
+    pub fn airspeedindicator_port(&self) -> Option<String> {
+        self.panels
+            .get("airspeedindicator")
+            .map(|panel| panel.port.clone())
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]

@@ -1,9 +1,11 @@
 use log::{debug, error};
+use panel::Panel;
 use sim::{AircraftSimState, SimClientEvent, SimCommunicator};
 use std::sync::mpsc;
 use std::{process, thread};
 
 use crate::config::Config;
+use crate::panels::airspeedindicator::AirspeedIndicatorPanel;
 use crate::panels::eventsim::EventSimPanel;
 
 mod config;
@@ -22,20 +24,39 @@ pub enum Event {
 fn try_main(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     debug!("Using config {:?}", config);
 
-    let eventsim_port = config
-        .eventsim_port()
-        .ok_or("EventSim port unspecified in config")?;
-
-    let (sim_tx, sim_rx) = mpsc::channel();
+    // Channel to transmit from hardware panels to the SimConnect client
     let (hw_tx, hw_rx) = mpsc::channel();
 
-    let sim_handle = thread::spawn(move || SimCommunicator::new(sim_tx, hw_rx).run());
-    let panel_handle =
-        thread::spawn(move || EventSimPanel::new(eventsim_port, hw_tx, sim_rx).run());
+    let mut panels: Vec<Box<dyn Panel>> = Vec::new();
+    let mut sim_txs = Vec::new();
 
-    panel_handle
-        .join()
-        .expect("Couldn't join on the associated thread")?;
+    // Initialization of EventSim panel
+    if let Some(port) = config.eventsim_port() {
+        let (sim_tx, sim_rx) = mpsc::channel();
+        let panel = EventSimPanel::new(port, hw_tx.clone(), sim_rx);
+        panels.push(Box::new(panel));
+        sim_txs.push(sim_tx);
+    };
+
+    // Initialization of airspeed indicator
+    if let Some(port) = config.airspeedindicator_port() {
+        let (sim_tx, sim_rx) = mpsc::channel();
+        let panel = AirspeedIndicatorPanel::new(port, sim_rx);
+        panels.push(Box::new(panel));
+        sim_txs.push(sim_tx);
+    };
+
+    // Start panel threads
+    let mut panel_handles = Vec::new();
+    for mut panel in panels {
+        panel_handles.push(thread::spawn(move || panel.run()));
+    }
+    // Start simconnect thread
+    let sim_handle = thread::spawn(move || SimCommunicator::new(sim_txs, hw_rx).run());
+
+    for handle in panel_handles {
+        handle.join().expect("Could not join on panel thread")?
+    }
     sim_handle
         .join()
         .expect("Couldn't join on the associated thread");

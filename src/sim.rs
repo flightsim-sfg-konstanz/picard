@@ -1,10 +1,11 @@
 use std::{sync::mpsc, time::Duration};
 
 use log::{debug, error, info, warn};
-use serialport::SerialPort;
 use simconnect_sdk::{FlxClientEvent, Notification, SimConnect, SimConnectError, SimConnectObject};
 
 use crate::Event;
+
+const SIMCONNECT_NAME: &str = "FSSK Panels";
 
 /// A data structure that will be used to receive data from SimConnect.
 /// See the documentation of `SimConnectObject` for more information on the arguments of the `simconnect` attribute.
@@ -17,6 +18,8 @@ struct AircraftSimData {
     gear_left_position: f64,
     #[simconnect(name = "GEAR RIGHT POSITION", unit = "percent over 100")]
     gear_right_position: f64,
+    #[simconnect(name = "AIRSPEED INDICATED", unit = "knots")]
+    airspeed: f64,
 
     /// Parking brake indicator.
     ///
@@ -26,12 +29,13 @@ struct AircraftSimData {
     parking_brake_indicator: bool,
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq)]
 pub struct AircraftSimState {
-    parking_brake_indicator: bool,
-    gear_center_state: LandingGearStatus,
-    gear_left_state: LandingGearStatus,
-    gear_right_state: LandingGearStatus,
+    pub parking_brake_indicator: bool,
+    pub gear_center_state: LandingGearStatus,
+    pub gear_left_state: LandingGearStatus,
+    pub gear_right_state: LandingGearStatus,
+    pub airspeed: f64,
 }
 
 impl From<AircraftSimData> for AircraftSimState {
@@ -41,22 +45,13 @@ impl From<AircraftSimData> for AircraftSimState {
             gear_center_state: value.gear_center_position.into(),
             gear_left_state: value.gear_left_position.into(),
             gear_right_state: value.gear_right_position.into(),
+            airspeed: value.airspeed,
         }
     }
 }
 
-impl AircraftSimState {
-    pub fn send_state(&self, tx: &mut Box<dyn SerialPort>) -> Result<(), std::io::Error> {
-        writeln!(tx, "PARKING_BRAKE:{}", self.parking_brake_indicator as i32)?;
-        writeln!(tx, "FRONT_GEAR_LED:{}", self.gear_center_state.as_int())?;
-        writeln!(tx, "LEFT_GEAR_LED:{}", self.gear_left_state.as_int())?;
-        writeln!(tx, "RIGHT_GEAR_LED:{}", self.gear_right_state.as_int())?;
-        Ok(())
-    }
-}
-
 #[derive(Debug, PartialEq, Eq)]
-enum LandingGearStatus {
+pub enum LandingGearStatus {
     Unknown,
     Up,
     Down,
@@ -75,7 +70,7 @@ impl From<f64> for LandingGearStatus {
 }
 
 impl LandingGearStatus {
-    fn as_int(&self) -> i32 {
+    pub fn as_int(&self) -> i32 {
         match self {
             LandingGearStatus::Up => 0,
             LandingGearStatus::Down => 1,
@@ -138,15 +133,15 @@ impl FlxClientEvent for SimClientEvent {
 
 pub struct SimCommunicator {
     connected: bool,
-    sim_tx: mpsc::Sender<Event>,
+    sim_txs: Vec<mpsc::Sender<Event>>,
     hw_rx: mpsc::Receiver<Event>,
 }
 
 impl SimCommunicator {
-    pub fn new(sim_tx: mpsc::Sender<Event>, hw_rx: mpsc::Receiver<Event>) -> Self {
+    pub fn new(sim_txs: Vec<mpsc::Sender<Event>>, hw_rx: mpsc::Receiver<Event>) -> Self {
         Self {
             connected: false,
-            sim_tx,
+            sim_txs,
             hw_rx,
         }
     }
@@ -154,7 +149,7 @@ impl SimCommunicator {
     pub fn run(&mut self) {
         loop {
             debug!("Attempting to connect via SimConnect");
-            match SimConnect::new("FSSK EventSim Main Panel") {
+            match SimConnect::new(SIMCONNECT_NAME) {
                 Ok(client) => match self.run_event_loop(client) {
                     // If we receive the exit signal, exit the thread
                     Ok(true) => return,
@@ -218,9 +213,11 @@ impl SimCommunicator {
                 Some(Notification::Object(data)) => {
                     let aircraft_state = AircraftSimData::try_from(&data)?;
                     debug!("Received SimConnect aircraft state {:?}", aircraft_state);
-                    self.sim_tx
-                        .send(Event::SetPanel(aircraft_state.into()))
-                        .expect("Failed to send to the control thread");
+                    for sim_tx in &self.sim_txs {
+                        sim_tx
+                            .send(Event::SetPanel(aircraft_state.clone().into()))
+                            .expect("Failed to send to panel");
+                    }
                 }
                 Some(unkn) => {
                     dbg!(unkn);
