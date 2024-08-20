@@ -31,6 +31,7 @@ impl Panel for AirspeedIndicatorPanel {
 
         // Reset device
         serial.write_data_terminal_ready(true)?;
+        serial.clear(serialport::ClearBuffer::All)?;
         // Wait for device to finish resetting
         thread::sleep(Duration::from_millis(2000));
 
@@ -40,7 +41,9 @@ impl Panel for AirspeedIndicatorPanel {
 
         // Verify that we are connected to the correct arduino
         reader.read_until(b';', &mut buf)?;
-        if String::from_utf8_lossy(&buf) == "Name<Airspeed-Indicator>;" {
+        let initial_msg = String::from_utf8_lossy(&buf);
+        debug!("Initial airspeed indicator message: '{initial_msg}'");
+        if initial_msg == "Name<Airspeed-Indicator>;" {
             info!(
                 "Connection with airspeed indicator panel established via {}",
                 self.port

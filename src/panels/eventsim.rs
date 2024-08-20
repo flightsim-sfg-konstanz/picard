@@ -41,6 +41,7 @@ impl Panel for EventSimPanel {
 
         // Reset device
         serial.write_data_terminal_ready(true)?;
+        serial.clear(serialport::ClearBuffer::All)?;
         // Wait for device to finish resetting
         thread::sleep(Duration::from_millis(2000));
 
