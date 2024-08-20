@@ -6,9 +6,9 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-env_logger = "0.10.0"
+env_logger = "0.11"
 log = { version = "0.4", features = ["serde"] }
 serde = { version = "1", features = ["derive"] }
 serialport = "4"
 simconnect-sdk = { git = "https://github.com/flightsim-sfg-konstanz/simconnect-sdk-rs.git", branch = "main", features = ["derive"] }
-toml = "0.7"
+toml = "0.8"
