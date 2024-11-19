@@ -175,10 +175,11 @@ impl SimCommunicator {
         loop {
             // Receive control messages if we are connected
             if self.connected {
-                match self.hw_rx.try_recv() {
-                    Ok(Event::SetSimulator(event)) => client.transmit_event(event)?,
-                    Err(mpsc::TryRecvError::Disconnected) => return Ok(true),
-                    _ => {}
+                // Loop to process all pending events in the channel at once
+                for msg in self.hw_rx.try_iter() {
+                    if let Event::SetSimulator(event) = msg {
+                        client.transmit_event(event)?;
+                    }
                 }
             }
 
