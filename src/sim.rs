@@ -1,7 +1,10 @@
 use std::{sync::mpsc, time::Duration};
 
 use log::{debug, error, info, warn};
-use simconnect_sdk::{FlxClientEvent, Notification, SimConnect, SimConnectError, SimConnectObject};
+use simconnect_sdk::{
+    ClientEvent, FlxClientEvent, Notification, SimConnect, SimConnectError, SimConnectObject,
+    SystemEvent,
+};
 
 use crate::Event;
 
@@ -86,13 +89,16 @@ pub enum FuelSystemPumpStatus {
     Auto = 2,
 }
 
+/// Client events which we are sending to the simulator
+///
+/// This enum starts at a higher number to not cause conflicts with system events defined in the simconnect dependency.
 #[derive(Debug, Clone)]
 #[repr(u32)]
 pub enum SimClientEvent {
     AlternatorSet {
         state: bool,
         alternator_index: u32,
-    },
+    } = 1337,
     Battery1Set(bool),
     Battery2Set(bool),
     AvionicsMaster1Set(bool),
@@ -220,6 +226,7 @@ impl FlxClientEvent for SimClientEvent {
 
 pub struct SimCommunicator {
     connected: bool,
+    sim_running: bool,
     sim_txs: Vec<mpsc::Sender<Event>>,
     hw_rx: mpsc::Receiver<Event>,
 }
@@ -228,6 +235,7 @@ impl SimCommunicator {
     pub fn new(sim_txs: Vec<mpsc::Sender<Event>>, hw_rx: mpsc::Receiver<Event>) -> Self {
         Self {
             connected: false,
+            sim_running: false,
             sim_txs,
             hw_rx,
         }
@@ -252,6 +260,7 @@ impl SimCommunicator {
 
             // We are now disconnected
             self.connected = false;
+            self.sim_running = false;
 
             // Wait before reconnecting
             std::thread::sleep(Duration::from_secs(5));
@@ -260,92 +269,102 @@ impl SimCommunicator {
 
     fn run_event_loop(&mut self, mut client: SimConnect) -> Result<bool, SimConnectError> {
         loop {
-            // Receive control messages if we are connected
-            if self.connected {
-                // Loop to process all pending events in the channel at once
-                for msg in self.hw_rx.try_iter() {
+            // Loop to process all pending events in the channel at once
+            for msg in self.hw_rx.try_iter() {
+                // Only process control messages if the sim is actually running
+                if self.sim_running {
                     if let Event::SetSimulator(event) = msg {
+                        debug!("Sending sim event {:?}", event);
                         client.transmit_event(event)?;
                     }
                 }
             }
 
-            match client.get_next_dispatch()? {
-                Some(Notification::Open) => {
-                    info!("Connection with flight simulator established");
-                    // After the connection is successfully open, we register the aircraft data struct
-                    client.register_object::<AircraftSimData>()?;
-                    // We register the events we want to send to the simulator
-                    client.map_client_event_to_sim_event(SimClientEvent::AlternatorSet {
-                        state: false,
-                        alternator_index: 0,
-                    })?;
-                    client.map_client_event_to_sim_event(SimClientEvent::Battery1Set(false))?;
-                    client.map_client_event_to_sim_event(SimClientEvent::Battery2Set(false))?;
-                    client
-                        .map_client_event_to_sim_event(SimClientEvent::AvionicsMaster1Set(false))?;
-                    client
-                        .map_client_event_to_sim_event(SimClientEvent::AvionicsMaster2Set(false))?;
-                    client.map_client_event_to_sim_event(SimClientEvent::BeaconLightOn)?;
-                    client.map_client_event_to_sim_event(SimClientEvent::BeaconLightOff)?;
-                    client.map_client_event_to_sim_event(SimClientEvent::NavLightsOn)?;
-                    client.map_client_event_to_sim_event(SimClientEvent::NavLightsOff)?;
-                    client.map_client_event_to_sim_event(SimClientEvent::StrobeLightsOn)?;
-                    client.map_client_event_to_sim_event(SimClientEvent::StrobeLightsOff)?;
-                    client.map_client_event_to_sim_event(SimClientEvent::TaxiLightsOn)?;
-                    client.map_client_event_to_sim_event(SimClientEvent::TaxiLightsOff)?;
-                    client.map_client_event_to_sim_event(SimClientEvent::LandingLightsOn)?;
-                    client.map_client_event_to_sim_event(SimClientEvent::LandingLightsOff)?;
-                    client.map_client_event_to_sim_event(SimClientEvent::ElecFuelPump1Set(
-                        FuelSystemPumpStatus::Off,
-                    ))?;
-                    client.map_client_event_to_sim_event(SimClientEvent::PitotHeatOn)?;
-                    client.map_client_event_to_sim_event(SimClientEvent::PitotHeatOff)?;
-                    client.map_client_event_to_sim_event(
-                        SimClientEvent::PanelLightsPowerSettingSet {
-                            light_circuit_index: 0,
-                            power_setting: 0.0,
-                        },
-                    )?;
-                    client.map_client_event_to_sim_event(
-                        SimClientEvent::PedestalLightsPowerSettingSet {
-                            light_circuit_index: 0,
-                            power_setting: 0.0,
-                        },
-                    )?;
-                    client.map_client_event_to_sim_event(
-                        SimClientEvent::LightPotentiometerSet {
-                            index: 0,
-                            potentiometer_value: 0.0,
-                        },
-                    )?;
-                    client.map_client_event_to_sim_event(SimClientEvent::FlapsUp)?;
-                    client.map_client_event_to_sim_event(SimClientEvent::FlapsDown)?;
-                    client.map_client_event_to_sim_event(SimClientEvent::ParkingBrakeOn)?;
-                    client.map_client_event_to_sim_event(SimClientEvent::ParkingBrakeOff)?;
-                    client.map_client_event_to_sim_event(SimClientEvent::LandingGearUp)?;
-                    client.map_client_event_to_sim_event(SimClientEvent::LandingGearDown)?;
+            if let Some(notification) = client.get_next_dispatch()? {
+                debug!("Received notification {:?}", notification);
+                match notification {
+                    Notification::Open => {
+                        info!("Connection with flight simulator established");
+                        // Receive a status whether the sim is running
+                        // On first connect, this status is always sent by the flight simulator
+                        client
+                            .subscribe_to_system_event(simconnect_sdk::SystemEventRequest::Sim)?;
+                        // We register the aircraft data struct
+                        client.register_object::<AircraftSimData>()?;
+                        // We register the events we want to send to the simulator
+                        client.map_client_event_to_sim_event(SimClientEvent::AlternatorSet {
+                            state: false,
+                            alternator_index: 0,
+                        })?;
+                        client.map_client_event_to_sim_event(SimClientEvent::Battery1Set(false))?;
+                        client.map_client_event_to_sim_event(SimClientEvent::Battery2Set(false))?;
+                        client.map_client_event_to_sim_event(
+                            SimClientEvent::AvionicsMaster1Set(false),
+                        )?;
+                        client.map_client_event_to_sim_event(
+                            SimClientEvent::AvionicsMaster2Set(false),
+                        )?;
+                        client.map_client_event_to_sim_event(SimClientEvent::BeaconLightOn)?;
+                        client.map_client_event_to_sim_event(SimClientEvent::BeaconLightOff)?;
+                        client.map_client_event_to_sim_event(SimClientEvent::NavLightsOn)?;
+                        client.map_client_event_to_sim_event(SimClientEvent::NavLightsOff)?;
+                        client.map_client_event_to_sim_event(SimClientEvent::StrobeLightsOn)?;
+                        client.map_client_event_to_sim_event(SimClientEvent::StrobeLightsOff)?;
+                        client.map_client_event_to_sim_event(SimClientEvent::TaxiLightsOn)?;
+                        client.map_client_event_to_sim_event(SimClientEvent::TaxiLightsOff)?;
+                        client.map_client_event_to_sim_event(SimClientEvent::LandingLightsOn)?;
+                        client.map_client_event_to_sim_event(SimClientEvent::LandingLightsOff)?;
+                        client.map_client_event_to_sim_event(SimClientEvent::ElecFuelPump1Set(
+                            FuelSystemPumpStatus::Off,
+                        ))?;
+                        client.map_client_event_to_sim_event(SimClientEvent::PitotHeatOn)?;
+                        client.map_client_event_to_sim_event(SimClientEvent::PitotHeatOff)?;
+                        client.map_client_event_to_sim_event(
+                            SimClientEvent::PanelLightsPowerSettingSet {
+                                light_circuit_index: 0,
+                                power_setting: 0.0,
+                            },
+                        )?;
+                        client.map_client_event_to_sim_event(
+                            SimClientEvent::PedestalLightsPowerSettingSet {
+                                light_circuit_index: 0,
+                                power_setting: 0.0,
+                            },
+                        )?;
+                        client.map_client_event_to_sim_event(
+                            SimClientEvent::LightPotentiometerSet {
+                                index: 0,
+                                potentiometer_value: 0.0,
+                            },
+                        )?;
+                        client.map_client_event_to_sim_event(SimClientEvent::FlapsUp)?;
+                        client.map_client_event_to_sim_event(SimClientEvent::FlapsDown)?;
+                        client.map_client_event_to_sim_event(SimClientEvent::ParkingBrakeOn)?;
+                        client.map_client_event_to_sim_event(SimClientEvent::ParkingBrakeOff)?;
+                        client.map_client_event_to_sim_event(SimClientEvent::LandingGearUp)?;
+                        client.map_client_event_to_sim_event(SimClientEvent::LandingGearDown)?;
 
-                    // We are now successfully connected
-                    self.connected = true;
-                }
-                Some(Notification::Quit) => {
-                    info!("Disconnected from flight simulator");
-                    return Ok(false);
-                }
-                Some(Notification::Object(data)) => {
-                    let aircraft_state = AircraftSimData::try_from(&data)?;
-                    debug!("Received SimConnect aircraft state {:?}", aircraft_state);
-                    for sim_tx in &self.sim_txs {
-                        sim_tx
-                            .send(Event::SetPanel(aircraft_state.clone().into()))
-                            .expect("Failed to send to panel");
+                        // We are now successfully connected
+                        self.connected = true;
                     }
+                    Notification::Quit => {
+                        info!("Disconnected from flight simulator");
+                        return Ok(false);
+                    }
+                    Notification::SystemEvent(SystemEvent::Sim { state }) => {
+                        self.sim_running = state
+                    }
+                    Notification::Object(data) => {
+                        let aircraft_state = AircraftSimData::try_from(&data)?;
+                        debug!("Received SimConnect aircraft state {:?}", aircraft_state);
+                        for sim_tx in &self.sim_txs {
+                            sim_tx
+                                .send(Event::SetPanel(aircraft_state.clone().into()))
+                                .expect("Failed to send to panel");
+                        }
+                    }
+                    _ => {}
                 }
-                Some(unkn) => {
-                    dbg!(unkn);
-                }
-                _ => {}
             }
 
             // Sleep for about a frame to reduce CPU usage
