@@ -6,6 +6,7 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
 
+use crate::bitfield::BitField;
 use crate::panel::Panel;
 use crate::panel::PanelError;
 use crate::sim::FuelSystemPumpStatus;
@@ -17,40 +18,6 @@ const BAUD_RATE: u32 = 115200;
 
 /// The number of data bytes in a normal COBS frame
 const DATA_LEN: usize = 6;
-
-#[derive(Debug)]
-struct SwitchState {
-    last_state: u16,
-    state: u16,
-}
-
-impl SwitchState {
-    fn new(b0: u8, b1: u8) -> Self {
-        Self {
-            last_state: !u16::from_be_bytes([b0, b1]),
-            state: u16::from_be_bytes([b0, b1]),
-        }
-    }
-
-    fn update(&mut self, b0: u8, b1: u8) {
-        self.last_state = self.state;
-        self.state = u16::from_be_bytes([b0, b1]);
-    }
-
-    fn is_set(&self, switch: Switch) -> bool {
-        self.state & switch as u16 > 0
-    }
-
-    fn has_changed(&self, switch: Switch) -> bool {
-        (self.state ^ self.last_state) & switch as u16 > 0
-    }
-
-    fn when_changed(&self, switch: Switch, func: impl FnOnce(bool)) {
-        if self.has_changed(switch) {
-            func(self.is_set(switch))
-        }
-    }
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Switch {
@@ -70,12 +37,18 @@ enum Switch {
     CabinPower12V,
 }
 
+impl From<Switch> for u16 {
+    fn from(value: Switch) -> Self {
+        value as u16
+    }
+}
+
 /// Represents the EventSim Main Panel and holds all state and information.
 #[derive(Debug)]
 pub struct C182TSwitchPanel {
     port: String,
     hw_tx: mpsc::Sender<Event>,
-    switch_states: SwitchState,
+    switch_states: BitField<u16>,
 }
 
 impl Panel for C182TSwitchPanel {
@@ -129,7 +102,7 @@ impl C182TSwitchPanel {
         Self {
             hw_tx,
             port: port.as_ref().into(),
-            switch_states: SwitchState::new(0, 0),
+            switch_states: BitField::new(0),
         }
     }
 
@@ -143,7 +116,8 @@ impl C182TSwitchPanel {
         }
 
         // Update all switch positions
-        self.switch_states.update(data[0], data[1]);
+        let state = u16::from_be_bytes([data[0], data[1]]);
+        self.switch_states.update(state);
 
         // Set switch positions in simulator
         self.switch_states
@@ -250,7 +224,6 @@ impl C182TSwitchPanel {
     }
 
     fn send_sim_event(&self, event: SimClientEvent) {
-        debug!("C182T switch panel sending sim event {:?}", event);
         self.hw_tx
             .send(Event::SetSimulator(event))
             .expect("SimConnect thread offline");

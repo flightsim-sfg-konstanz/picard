@@ -9,6 +9,7 @@ use crate::config::Config;
 use crate::panels::airspeedindicator::AirspeedIndicatorPanel;
 use crate::panels::eventsim::EventSimPanel;
 
+mod bitfield;
 mod config;
 mod panel;
 mod panels;
