@@ -79,17 +79,51 @@ impl LandingGearStatus {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FuelSystemPumpStatus {
+    Off = 0,
+    On = 1,
+    Auto = 2,
+}
+
+#[derive(Debug, Clone)]
 #[repr(u32)]
 pub enum SimClientEvent {
-    LandingLightsOn,
-    LandingLightsOff,
-    TaxiLightsOn,
-    TaxiLightsOff,
-    StrobeLightsOn,
-    StrobeLightsOff,
+    AlternatorSet {
+        state: bool,
+        alternator_index: u32,
+    },
+    Battery1Set(bool),
+    Battery2Set(bool),
+    AvionicsMaster1Set(bool),
+    AvionicsMaster2Set(bool),
+    BeaconLightOn,
+    BeaconLightOff,
     NavLightsOn,
     NavLightsOff,
+    StrobeLightsOn,
+    StrobeLightsOff,
+    TaxiLightsOn,
+    TaxiLightsOff,
+    LandingLightsOn,
+    LandingLightsOff,
+    ElecFuelPump1Set(FuelSystemPumpStatus),
+    PitotHeatOn,
+    PitotHeatOff,
+    CabinPwrOn,
+    CabinPwrOff,
+    PanelLightsPowerSettingSet {
+        light_circuit_index: u32,
+        power_setting: f32,
+    },
+    PedestalLightsPowerSettingSet {
+        light_circuit_index: u32,
+        power_setting: f32,
+    },
+    LightPotentiometerSet {
+        index: u32,
+        potentiometer_value: f32,
+    },
     FlapsUp,
     FlapsDown,
     ParkingBrakeOn,
@@ -99,19 +133,39 @@ pub enum SimClientEvent {
 }
 impl FlxClientEvent for SimClientEvent {
     fn event_id(&self) -> u32 {
-        *self as u32
+        // SAFETY: Because `Self` is marked `repr(u8)`, its layout is a `repr(C)` `union`
+        // between `repr(C)` structs, each of which has the `u8` discriminant as its first
+        // field, so we can read the discriminant without offsetting the pointer.
+        unsafe { *<*const _>::from(self).cast::<u32>() }
     }
 
     fn event_name(&self) -> *const std::ffi::c_char {
         (match self {
-            SimClientEvent::LandingLightsOn => "LANDING_LIGHTS_ON\0",
-            SimClientEvent::LandingLightsOff => "LANDING_LIGHTS_OFF\0",
-            SimClientEvent::TaxiLightsOn => "TAXI_LIGHTS_ON\0",
-            SimClientEvent::TaxiLightsOff => "TAXI_LIGHTS_OFF\0",
-            SimClientEvent::StrobeLightsOn => "STROBES_ON\0",
-            SimClientEvent::StrobeLightsOff => "STROBES_OFF\0",
+            SimClientEvent::AlternatorSet { .. } => "ALTERNATOR_SET\0",
+            SimClientEvent::Battery1Set { .. } => "BATTERY1_SET\0",
+            SimClientEvent::Battery2Set { .. } => "BATTERY2_SET\0",
+            SimClientEvent::AvionicsMaster1Set { .. } => "AVIONICS_MASTER_1_SET\0",
+            SimClientEvent::AvionicsMaster2Set { .. } => "AVIONICS_MASTER_2_Set\0",
+            SimClientEvent::BeaconLightOn => "BEACON_LIGHTS_ON\0",
+            SimClientEvent::BeaconLightOff => "BEACON_LIGHTS_OFF\0",
             SimClientEvent::NavLightsOn => "NAV_LIGHTS_ON\0",
             SimClientEvent::NavLightsOff => "NAV_LIGHTS_OFF\0",
+            SimClientEvent::StrobeLightsOn => "STROBES_ON\0",
+            SimClientEvent::StrobeLightsOff => "STROBES_OFF\0",
+            SimClientEvent::TaxiLightsOn => "TAXI_LIGHTS_ON\0",
+            SimClientEvent::TaxiLightsOff => "TAXI_LIGHTS_OFF\0",
+            SimClientEvent::LandingLightsOn => "LANDING_LIGHTS_ON\0",
+            SimClientEvent::LandingLightsOff => "LANDING_LIGHTS_OFF\0",
+            SimClientEvent::ElecFuelPump1Set { .. } => "ELECT_FUEL_PUMP1_SET\0",
+            SimClientEvent::PitotHeatOn => "PITOT_HEAT_ON\0",
+            SimClientEvent::PitotHeatOff => "PITOT_HEAT_OFF\0",
+            SimClientEvent::CabinPwrOn => todo!(),
+            SimClientEvent::CabinPwrOff => todo!(),
+            SimClientEvent::PanelLightsPowerSettingSet { .. } => "PANEL_LIGHTS_POWER_SETTING_SET\0",
+            SimClientEvent::PedestalLightsPowerSettingSet { .. } => {
+                "PEDESTRAL_LIGHTS_POWER_SETTING_SET\0"
+            }
+            SimClientEvent::LightPotentiometerSet { .. } => "LIGHT_POTENTIOMETER_SET\0",
             SimClientEvent::FlapsUp => "FLAPS_DECR\0",
             SimClientEvent::FlapsDown => "FLAPS_INCR\0",
             SimClientEvent::ParkingBrakeOn => "PARKING_BRAKE_SET\0",
@@ -122,11 +176,44 @@ impl FlxClientEvent for SimClientEvent {
         .as_ptr() as *const std::ffi::c_char
     }
 
-    fn data(&self) -> u32 {
+    fn data(&self) -> (u32, u32, u32, u32, u32) {
         match self {
-            SimClientEvent::ParkingBrakeOn => 1,
-            SimClientEvent::ParkingBrakeOff => 0,
-            _ => 0,
+            SimClientEvent::AlternatorSet {
+                state,
+                alternator_index,
+            } => (*state as u32, *alternator_index, 0, 0, 0),
+            SimClientEvent::Battery1Set(state) => (*state as u32, 0, 0, 0, 0),
+            SimClientEvent::Battery2Set(state) => (*state as u32, 0, 0, 0, 0),
+            SimClientEvent::AvionicsMaster1Set(state) => (*state as u32, 0, 0, 0, 0),
+            SimClientEvent::AvionicsMaster2Set(state) => (*state as u32, 0, 0, 0, 0),
+            SimClientEvent::ElecFuelPump1Set(state) => (state.clone() as u32, 0, 0, 0, 0),
+            SimClientEvent::PanelLightsPowerSettingSet {
+                light_circuit_index,
+                power_setting,
+            } => (
+                *light_circuit_index,
+                (*power_setting * 100.0) as u32,
+                0,
+                0,
+                0,
+            ),
+            SimClientEvent::PedestalLightsPowerSettingSet {
+                light_circuit_index,
+                power_setting,
+            } => (
+                *light_circuit_index,
+                (*power_setting * 100.0) as u32,
+                0,
+                0,
+                0,
+            ),
+            SimClientEvent::LightPotentiometerSet {
+                index,
+                potentiometer_value,
+            } => (*index, (*potentiometer_value * 100.0) as u32, 0, 0, 0),
+            SimClientEvent::ParkingBrakeOn => (1, 0, 0, 0, 0),
+            SimClientEvent::ParkingBrakeOff => (0, 0, 0, 0, 0),
+            _ => (0, 0, 0, 0, 0),
         }
     }
 }
@@ -189,14 +276,49 @@ impl SimCommunicator {
                     // After the connection is successfully open, we register the aircraft data struct
                     client.register_object::<AircraftSimData>()?;
                     // We register the events we want to send to the simulator
-                    client.map_client_event_to_sim_event(SimClientEvent::LandingLightsOn)?;
-                    client.map_client_event_to_sim_event(SimClientEvent::LandingLightsOff)?;
-                    client.map_client_event_to_sim_event(SimClientEvent::TaxiLightsOn)?;
-                    client.map_client_event_to_sim_event(SimClientEvent::TaxiLightsOff)?;
-                    client.map_client_event_to_sim_event(SimClientEvent::StrobeLightsOn)?;
-                    client.map_client_event_to_sim_event(SimClientEvent::StrobeLightsOff)?;
+                    client.map_client_event_to_sim_event(SimClientEvent::AlternatorSet {
+                        state: false,
+                        alternator_index: 0,
+                    })?;
+                    client.map_client_event_to_sim_event(SimClientEvent::Battery1Set(false))?;
+                    client.map_client_event_to_sim_event(SimClientEvent::Battery2Set(false))?;
+                    client
+                        .map_client_event_to_sim_event(SimClientEvent::AvionicsMaster1Set(false))?;
+                    client
+                        .map_client_event_to_sim_event(SimClientEvent::AvionicsMaster2Set(false))?;
+                    client.map_client_event_to_sim_event(SimClientEvent::BeaconLightOn)?;
+                    client.map_client_event_to_sim_event(SimClientEvent::BeaconLightOff)?;
                     client.map_client_event_to_sim_event(SimClientEvent::NavLightsOn)?;
                     client.map_client_event_to_sim_event(SimClientEvent::NavLightsOff)?;
+                    client.map_client_event_to_sim_event(SimClientEvent::StrobeLightsOn)?;
+                    client.map_client_event_to_sim_event(SimClientEvent::StrobeLightsOff)?;
+                    client.map_client_event_to_sim_event(SimClientEvent::TaxiLightsOn)?;
+                    client.map_client_event_to_sim_event(SimClientEvent::TaxiLightsOff)?;
+                    client.map_client_event_to_sim_event(SimClientEvent::LandingLightsOn)?;
+                    client.map_client_event_to_sim_event(SimClientEvent::LandingLightsOff)?;
+                    client.map_client_event_to_sim_event(SimClientEvent::ElecFuelPump1Set(
+                        FuelSystemPumpStatus::Off,
+                    ))?;
+                    client.map_client_event_to_sim_event(SimClientEvent::PitotHeatOn)?;
+                    client.map_client_event_to_sim_event(SimClientEvent::PitotHeatOff)?;
+                    client.map_client_event_to_sim_event(
+                        SimClientEvent::PanelLightsPowerSettingSet {
+                            light_circuit_index: 0,
+                            power_setting: 0.0,
+                        },
+                    )?;
+                    client.map_client_event_to_sim_event(
+                        SimClientEvent::PedestalLightsPowerSettingSet {
+                            light_circuit_index: 0,
+                            power_setting: 0.0,
+                        },
+                    )?;
+                    client.map_client_event_to_sim_event(
+                        SimClientEvent::LightPotentiometerSet {
+                            index: 0,
+                            potentiometer_value: 0.0,
+                        },
+                    )?;
                     client.map_client_event_to_sim_event(SimClientEvent::FlapsUp)?;
                     client.map_client_event_to_sim_event(SimClientEvent::FlapsDown)?;
                     client.map_client_event_to_sim_event(SimClientEvent::ParkingBrakeOn)?;

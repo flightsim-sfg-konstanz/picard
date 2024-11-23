@@ -1,5 +1,6 @@
 use log::{debug, error};
 use panel::Panel;
+use panels::c182t_switch::C182TSwitchPanel;
 use sim::{AircraftSimState, SimClientEvent, SimCommunicator};
 use std::sync::mpsc;
 use std::{process, thread};
@@ -42,6 +43,12 @@ fn run(config: Config) {
         let panel = AirspeedIndicatorPanel::new(port, sim_rx);
         panels.push(Box::new(panel));
         sim_txs.push(sim_tx);
+    };
+
+    // Initialization of C182T switch panel
+    if let Some(port) = config.c182t_switch_panel_port() {
+        let panel = C182TSwitchPanel::new(port, hw_tx.clone());
+        panels.push(Box::new(panel));
     };
 
     // Start threads

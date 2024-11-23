@@ -21,6 +21,12 @@ impl Config {
         self.panels.get("eventsim").map(|panel| panel.port.clone())
     }
 
+    pub fn c182t_switch_panel_port(&self) -> Option<String> {
+        self.panels
+            .get("c182t_switch")
+            .map(|panel| panel.port.clone())
+    }
+
     pub fn airspeedindicator_port(&self) -> Option<String> {
         self.panels
             .get("airspeedindicator")
