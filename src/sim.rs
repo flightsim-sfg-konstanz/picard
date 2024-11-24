@@ -1,14 +1,62 @@
-use std::{sync::mpsc, time::Duration};
+use std::{
+    fmt::Display,
+    sync::{mpsc, Arc, RwLock},
+    time::Duration,
+};
 
-use log::{debug, error, info, warn};
+use log::{debug, info, warn};
 use simconnect_sdk::{
-    ClientEvent, FlxClientEvent, Notification, SimConnect, SimConnectError, SimConnectObject,
-    SystemEvent,
+    FlxClientEvent, Notification, SimConnect, SimConnectError, SimConnectObject, SystemEvent,
 };
 
 use crate::Event;
 
 const SIMCONNECT_NAME: &str = "FSSK Panels";
+
+#[derive(Debug)]
+pub struct SimState {
+    pub sim_connected: bool,
+    pub sim_running: bool,
+}
+
+impl SimState {
+    pub fn new() -> Self {
+        Self {
+            sim_connected: false,
+            sim_running: false,
+        }
+    }
+
+    fn disconnected(&mut self) {
+        self.sim_connected = false;
+        self.sim_running = false;
+    }
+}
+
+#[derive(Debug)]
+enum SimError {
+    /// Failed to connect to the simulator
+    Connect(SimConnectError),
+    /// Error during communication with the simulator during runtime
+    Runtime(SimConnectError),
+}
+
+impl std::error::Error for SimError {}
+
+impl Display for SimError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SimError::Connect(e) => write!(f, "Failed to connect via SimConnect: {}", e),
+            SimError::Runtime(e) => write!(f, "SimConnect communication error: {}", e),
+        }
+    }
+}
+
+impl From<SimConnectError> for SimError {
+    fn from(value: SimConnectError) -> Self {
+        SimError::Runtime(value)
+    }
+}
 
 /// A data structure that will be used to receive data from SimConnect.
 /// See the documentation of `SimConnectObject` for more information on the arguments of the `simconnect` attribute.
@@ -225,17 +273,19 @@ impl FlxClientEvent for SimClientEvent {
 }
 
 pub struct SimCommunicator {
-    connected: bool,
-    sim_running: bool,
+    sim_state: Arc<RwLock<SimState>>,
     sim_txs: Vec<mpsc::Sender<Event>>,
     hw_rx: mpsc::Receiver<Event>,
 }
 
 impl SimCommunicator {
-    pub fn new(sim_txs: Vec<mpsc::Sender<Event>>, hw_rx: mpsc::Receiver<Event>) -> Self {
+    pub fn new(
+        sim_state: Arc<RwLock<SimState>>,
+        sim_txs: Vec<mpsc::Sender<Event>>,
+        hw_rx: mpsc::Receiver<Event>,
+    ) -> Self {
         Self {
-            connected: false,
-            sim_running: false,
+            sim_state,
             sim_txs,
             hw_rx,
         }
@@ -244,115 +294,50 @@ impl SimCommunicator {
     pub fn run(&mut self) {
         loop {
             debug!("Attempting to connect via SimConnect");
-            match SimConnect::new(SIMCONNECT_NAME) {
-                Ok(client) => match self.run_event_loop(client) {
-                    // If we receive the exit signal, exit the thread
-                    Ok(true) => return,
-                    // Peaceful disconnect from simulator, reconnect later
-                    Ok(false) => {}
-                    // Got SimConnect error, notify user
-                    Err(e) => error!("SimConnect communication error: {:?}", e),
-                },
-                Err(e) => {
-                    warn!("Failed to connect via SimConnect: {:?}", e);
-                }
-            }
-
-            // We are now disconnected
-            self.connected = false;
-            self.sim_running = false;
-
+            if let Err(e) = self.connect_and_process() {
+                warn!("{}", e)
+            };
             // Wait before reconnecting
             std::thread::sleep(Duration::from_secs(5));
         }
     }
 
-    fn run_event_loop(&mut self, mut client: SimConnect) -> Result<bool, SimConnectError> {
+    fn connect_and_process(&mut self) -> Result<(), SimError> {
+        // Connect via SimConnect
+        let client = SimConnect::new(SIMCONNECT_NAME).map_err(SimError::Connect)?;
+        // Run forever until we cause an error
+        if let Err(e) = self.run_event_loop(client) {
+            self.sim_state.write().unwrap().disconnected();
+            return Err(e.into());
+        }
+        // Simulator closed the connection normally
+        Ok(())
+    }
+
+    fn run_event_loop(&mut self, mut client: SimConnect) -> Result<(), SimConnectError> {
         loop {
             // Loop to process all pending events in the channel at once
             for msg in self.hw_rx.try_iter() {
-                // Only process control messages if the sim is actually running
-                if self.sim_running {
-                    if let Event::SetSimulator(event) = msg {
-                        debug!("Sending sim event {:?}", event);
-                        client.transmit_event(event)?;
-                    }
-                }
+                self.process_hw_event(&client, msg)?;
             }
 
-            if let Some(notification) = client.get_next_dispatch()? {
+            // Loop to process all pending sim events
+            while let Some(notification) = client.get_next_dispatch()? {
                 debug!("Received notification {:?}", notification);
                 match notification {
                     Notification::Open => {
                         info!("Connection with flight simulator established");
-                        // Receive a status whether the sim is running
-                        // On first connect, this status is always sent by the flight simulator
-                        client
-                            .subscribe_to_system_event(simconnect_sdk::SystemEventRequest::Sim)?;
-                        // We register the aircraft data struct
-                        client.register_object::<AircraftSimData>()?;
-                        // We register the events we want to send to the simulator
-                        client.map_client_event_to_sim_event(SimClientEvent::AlternatorSet {
-                            state: false,
-                            alternator_index: 0,
-                        })?;
-                        client.map_client_event_to_sim_event(SimClientEvent::Battery1Set(false))?;
-                        client.map_client_event_to_sim_event(SimClientEvent::Battery2Set(false))?;
-                        client.map_client_event_to_sim_event(
-                            SimClientEvent::AvionicsMaster1Set(false),
-                        )?;
-                        client.map_client_event_to_sim_event(
-                            SimClientEvent::AvionicsMaster2Set(false),
-                        )?;
-                        client.map_client_event_to_sim_event(SimClientEvent::BeaconLightOn)?;
-                        client.map_client_event_to_sim_event(SimClientEvent::BeaconLightOff)?;
-                        client.map_client_event_to_sim_event(SimClientEvent::NavLightsOn)?;
-                        client.map_client_event_to_sim_event(SimClientEvent::NavLightsOff)?;
-                        client.map_client_event_to_sim_event(SimClientEvent::StrobeLightsOn)?;
-                        client.map_client_event_to_sim_event(SimClientEvent::StrobeLightsOff)?;
-                        client.map_client_event_to_sim_event(SimClientEvent::TaxiLightsOn)?;
-                        client.map_client_event_to_sim_event(SimClientEvent::TaxiLightsOff)?;
-                        client.map_client_event_to_sim_event(SimClientEvent::LandingLightsOn)?;
-                        client.map_client_event_to_sim_event(SimClientEvent::LandingLightsOff)?;
-                        client.map_client_event_to_sim_event(SimClientEvent::ElecFuelPump1Set(
-                            FuelSystemPumpStatus::Off,
-                        ))?;
-                        client.map_client_event_to_sim_event(SimClientEvent::PitotHeatOn)?;
-                        client.map_client_event_to_sim_event(SimClientEvent::PitotHeatOff)?;
-                        client.map_client_event_to_sim_event(
-                            SimClientEvent::PanelLightsPowerSettingSet {
-                                light_circuit_index: 0,
-                                power_setting: 0.0,
-                            },
-                        )?;
-                        client.map_client_event_to_sim_event(
-                            SimClientEvent::PedestalLightsPowerSettingSet {
-                                light_circuit_index: 0,
-                                power_setting: 0.0,
-                            },
-                        )?;
-                        client.map_client_event_to_sim_event(
-                            SimClientEvent::LightPotentiometerSet {
-                                index: 0,
-                                potentiometer_value: 0.0,
-                            },
-                        )?;
-                        client.map_client_event_to_sim_event(SimClientEvent::FlapsUp)?;
-                        client.map_client_event_to_sim_event(SimClientEvent::FlapsDown)?;
-                        client.map_client_event_to_sim_event(SimClientEvent::ParkingBrakeOn)?;
-                        client.map_client_event_to_sim_event(SimClientEvent::ParkingBrakeOff)?;
-                        client.map_client_event_to_sim_event(SimClientEvent::LandingGearUp)?;
-                        client.map_client_event_to_sim_event(SimClientEvent::LandingGearDown)?;
-
-                        // We are now successfully connected
-                        self.connected = true;
+                        Self::register_events(&mut client)?;
+                        self.sim_state.write().unwrap().sim_connected = true;
                     }
                     Notification::Quit => {
                         info!("Disconnected from flight simulator");
-                        return Ok(false);
+                        self.sim_state.write().unwrap().disconnected();
+                        return Ok(());
                     }
                     Notification::SystemEvent(SystemEvent::Sim { state }) => {
-                        self.sim_running = state
+                        info!("Current simulation state: {}", state);
+                        self.sim_state.write().unwrap().sim_running = state;
                     }
                     Notification::Object(data) => {
                         let aircraft_state = AircraftSimData::try_from(&data)?;
@@ -370,5 +355,68 @@ impl SimCommunicator {
             // Sleep for about a frame to reduce CPU usage
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
+    }
+
+    /// Handle the events received from hardware
+    ///
+    /// Note: hardware is responsible to only issue events when the simulator is running.
+    fn process_hw_event(&self, client: &SimConnect, msg: Event) -> Result<(), SimConnectError> {
+        if let Event::SetSimulator(event) = msg {
+            debug!("Sending sim event {:?}", event);
+            client.transmit_event(event)?;
+        }
+        Ok(())
+    }
+
+    fn register_events(client: &mut SimConnect) -> Result<(), SimConnectError> {
+        // Receive a status whether the sim is running
+        // On first connect, this status is always sent by the flight simulator
+        client.subscribe_to_system_event(simconnect_sdk::SystemEventRequest::Sim)?;
+        // We register the aircraft data struct
+        client.register_object::<AircraftSimData>()?;
+        // We register the events we want to send to the simulator
+        client.map_client_event_to_sim_event(SimClientEvent::AlternatorSet {
+            state: false,
+            alternator_index: 0,
+        })?;
+        client.map_client_event_to_sim_event(SimClientEvent::Battery1Set(false))?;
+        client.map_client_event_to_sim_event(SimClientEvent::Battery2Set(false))?;
+        client.map_client_event_to_sim_event(SimClientEvent::AvionicsMaster1Set(false))?;
+        client.map_client_event_to_sim_event(SimClientEvent::AvionicsMaster2Set(false))?;
+        client.map_client_event_to_sim_event(SimClientEvent::BeaconLightOn)?;
+        client.map_client_event_to_sim_event(SimClientEvent::BeaconLightOff)?;
+        client.map_client_event_to_sim_event(SimClientEvent::NavLightsOn)?;
+        client.map_client_event_to_sim_event(SimClientEvent::NavLightsOff)?;
+        client.map_client_event_to_sim_event(SimClientEvent::StrobeLightsOn)?;
+        client.map_client_event_to_sim_event(SimClientEvent::StrobeLightsOff)?;
+        client.map_client_event_to_sim_event(SimClientEvent::TaxiLightsOn)?;
+        client.map_client_event_to_sim_event(SimClientEvent::TaxiLightsOff)?;
+        client.map_client_event_to_sim_event(SimClientEvent::LandingLightsOn)?;
+        client.map_client_event_to_sim_event(SimClientEvent::LandingLightsOff)?;
+        client.map_client_event_to_sim_event(SimClientEvent::ElecFuelPump1Set(
+            FuelSystemPumpStatus::Off,
+        ))?;
+        client.map_client_event_to_sim_event(SimClientEvent::PitotHeatOn)?;
+        client.map_client_event_to_sim_event(SimClientEvent::PitotHeatOff)?;
+        client.map_client_event_to_sim_event(SimClientEvent::PanelLightsPowerSettingSet {
+            light_circuit_index: 0,
+            power_setting: 0.0,
+        })?;
+        client.map_client_event_to_sim_event(SimClientEvent::PedestalLightsPowerSettingSet {
+            light_circuit_index: 0,
+            power_setting: 0.0,
+        })?;
+        client.map_client_event_to_sim_event(SimClientEvent::LightPotentiometerSet {
+            index: 0,
+            potentiometer_value: 0.0,
+        })?;
+        client.map_client_event_to_sim_event(SimClientEvent::FlapsUp)?;
+        client.map_client_event_to_sim_event(SimClientEvent::FlapsDown)?;
+        client.map_client_event_to_sim_event(SimClientEvent::ParkingBrakeOn)?;
+        client.map_client_event_to_sim_event(SimClientEvent::ParkingBrakeOff)?;
+        client.map_client_event_to_sim_event(SimClientEvent::LandingGearUp)?;
+        client.map_client_event_to_sim_event(SimClientEvent::LandingGearDown)?;
+
+        Ok(())
     }
 }

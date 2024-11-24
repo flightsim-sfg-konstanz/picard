@@ -4,6 +4,8 @@ use serialport::SerialPort;
 use std::io::BufRead;
 use std::io::BufReader;
 use std::sync::mpsc;
+use std::sync::Arc;
+use std::sync::RwLock;
 use std::thread;
 use std::time::Duration;
 use std::time::Instant;
@@ -13,6 +15,7 @@ use crate::panel::PanelError;
 use crate::sim::AircraftSimState;
 use crate::sim::SimClientEvent;
 use crate::Event;
+use crate::SimState;
 
 /// The baud rate of the Arduino used for the serial connection.
 const BAUD_RATE: u32 = 115200;
@@ -20,6 +23,7 @@ const BAUD_RATE: u32 = 115200;
 /// Represents the EventSim Main Panel and holds all state and information.
 #[derive(Debug)]
 pub struct EventSimPanel {
+    sim_state: Arc<RwLock<SimState>>,
     port: String,
     connected: bool,
     hw_tx: mpsc::Sender<Event>,
@@ -114,11 +118,13 @@ impl Panel for EventSimPanel {
 impl EventSimPanel {
     /// Create a new panel instance.
     pub fn new(
+        sim_state: Arc<RwLock<SimState>>,
         port: impl AsRef<str>,
         hw_tx: mpsc::Sender<Event>,
         sim_rx: mpsc::Receiver<Event>,
     ) -> Self {
         Self {
+            sim_state,
             connected: false,
             hw_tx,
             sim_rx,
@@ -129,26 +135,28 @@ impl EventSimPanel {
 
     fn handle_serial_command(&self, cmd: &str) {
         debug!("Serial port received command: {:?}", cmd);
-        let event = match cmd {
-            "MISC1:0" => SimClientEvent::TaxiLightsOff,
-            "MISC1:1" => SimClientEvent::TaxiLightsOn,
-            "MISC2:0" => SimClientEvent::LandingLightsOff,
-            "MISC2:1" => SimClientEvent::LandingLightsOn,
-            "MISC3:0" => SimClientEvent::NavLightsOff,
-            "MISC3:1" => SimClientEvent::NavLightsOn,
-            "MISC4:0" => SimClientEvent::StrobeLightsOff,
-            "MISC4:1" => SimClientEvent::StrobeLightsOn,
-            "FLAPS_UP" => SimClientEvent::FlapsUp,
-            "FLAPS_DN" => SimClientEvent::FlapsDown,
-            "PARKING_BRAKE:0" => SimClientEvent::ParkingBrakeOff,
-            "PARKING_BRAKE:1" => SimClientEvent::ParkingBrakeOn,
-            "LANDING_GEAR:0" => SimClientEvent::LandingGearUp,
-            "LANDING_GEAR:1" => SimClientEvent::LandingGearDown,
-            _ => return,
-        };
-        self.hw_tx
-            .send(Event::SetSimulator(event))
-            .expect("SimConnect thread offline");
+        if self.sim_state.read().unwrap().sim_running {
+            let event = match cmd {
+                "MISC1:0" => SimClientEvent::TaxiLightsOff,
+                "MISC1:1" => SimClientEvent::TaxiLightsOn,
+                "MISC2:0" => SimClientEvent::LandingLightsOff,
+                "MISC2:1" => SimClientEvent::LandingLightsOn,
+                "MISC3:0" => SimClientEvent::NavLightsOff,
+                "MISC3:1" => SimClientEvent::NavLightsOn,
+                "MISC4:0" => SimClientEvent::StrobeLightsOff,
+                "MISC4:1" => SimClientEvent::StrobeLightsOn,
+                "FLAPS_UP" => SimClientEvent::FlapsUp,
+                "FLAPS_DN" => SimClientEvent::FlapsDown,
+                "PARKING_BRAKE:0" => SimClientEvent::ParkingBrakeOff,
+                "PARKING_BRAKE:1" => SimClientEvent::ParkingBrakeOn,
+                "LANDING_GEAR:0" => SimClientEvent::LandingGearUp,
+                "LANDING_GEAR:1" => SimClientEvent::LandingGearDown,
+                _ => return,
+            };
+            self.hw_tx
+                .send(Event::SetSimulator(event))
+                .expect("SimConnect thread offline");
+        }
     }
 }
 

@@ -1,8 +1,8 @@
 use log::{debug, error};
 use panel::Panel;
 use panels::c182t_switch::C182TSwitchPanel;
-use sim::{AircraftSimState, SimClientEvent, SimCommunicator};
-use std::sync::mpsc;
+use sim::{AircraftSimState, SimClientEvent, SimCommunicator, SimState};
+use std::sync::{mpsc, Arc, RwLock};
 use std::{process, thread};
 
 use crate::config::Config;
@@ -27,13 +27,14 @@ fn run(config: Config) {
     // Channel to transmit from hardware panels to the SimConnect client
     let (hw_tx, hw_rx) = mpsc::channel();
 
+    let sim_state = Arc::new(RwLock::new(SimState::new()));
     let mut panels: Vec<Box<dyn Panel>> = Vec::new();
     let mut sim_txs = Vec::new();
 
     // Initialization of EventSim panel
     if let Some(port) = config.eventsim_port() {
         let (sim_tx, sim_rx) = mpsc::channel();
-        let panel = EventSimPanel::new(port, hw_tx.clone(), sim_rx);
+        let panel = EventSimPanel::new(sim_state.clone(), port, hw_tx.clone(), sim_rx);
         panels.push(Box::new(panel));
         sim_txs.push(sim_tx);
     };
@@ -48,7 +49,7 @@ fn run(config: Config) {
 
     // Initialization of C182T switch panel
     if let Some(port) = config.c182t_switch_panel_port() {
-        let panel = C182TSwitchPanel::new(port, hw_tx.clone());
+        let panel = C182TSwitchPanel::new(sim_state.clone(), port, hw_tx.clone());
         panels.push(Box::new(panel));
     };
 
@@ -62,7 +63,7 @@ fn run(config: Config) {
         }));
     }
     handles.push(thread::spawn(move || {
-        SimCommunicator::new(sim_txs, hw_rx).run()
+        SimCommunicator::new(sim_state, sim_txs, hw_rx).run()
     }));
 
     for handle in handles {

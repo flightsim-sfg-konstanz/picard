@@ -3,6 +3,8 @@ use log::warn;
 use std::io::BufRead;
 use std::io::BufReader;
 use std::sync::mpsc;
+use std::sync::Arc;
+use std::sync::RwLock;
 use std::thread;
 use std::time::Duration;
 
@@ -12,6 +14,7 @@ use crate::panel::PanelError;
 use crate::sim::FuelSystemPumpStatus;
 use crate::sim::SimClientEvent;
 use crate::Event;
+use crate::SimState;
 
 /// The baud rate of the Arduino used for the serial connection.
 const BAUD_RATE: u32 = 115200;
@@ -46,6 +49,7 @@ impl From<Switch> for u16 {
 /// Represents the EventSim Main Panel and holds all state and information.
 #[derive(Debug)]
 pub struct C182TSwitchPanel {
+    sim_state: Arc<RwLock<SimState>>,
     port: String,
     hw_tx: mpsc::Sender<Event>,
     switch_states: BitField<u16>,
@@ -98,8 +102,13 @@ impl Panel for C182TSwitchPanel {
 
 impl C182TSwitchPanel {
     /// Create a new panel instance.
-    pub fn new(port: impl AsRef<str>, hw_tx: mpsc::Sender<Event>) -> Self {
+    pub fn new(
+        sim_state: Arc<RwLock<SimState>>,
+        port: impl AsRef<str>,
+        hw_tx: mpsc::Sender<Event>,
+    ) -> Self {
         Self {
+            sim_state,
             hw_tx,
             port: port.as_ref().into(),
             switch_states: BitField::new(0),
@@ -224,8 +233,10 @@ impl C182TSwitchPanel {
     }
 
     fn send_sim_event(&self, event: SimClientEvent) {
-        self.hw_tx
-            .send(Event::SetSimulator(event))
-            .expect("SimConnect thread offline");
+        if self.sim_state.read().unwrap().sim_running {
+            self.hw_tx
+                .send(Event::SetSimulator(event))
+                .expect("SimConnect thread offline");
+        }
     }
 }
