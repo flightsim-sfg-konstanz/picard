@@ -13,7 +13,7 @@ where
     pub fn new(state: T) -> Self {
         Self {
             last_state: None,
-            state: state,
+            state,
         }
     }
 

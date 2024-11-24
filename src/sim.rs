@@ -4,7 +4,7 @@ use std::{
     time::Duration,
 };
 
-use log::{debug, info, warn};
+use log::{debug, error, info, warn};
 use simconnect_sdk::{
     FlxClientEvent, Notification, SimConnect, SimConnectError, SimConnectObject, SystemEvent,
 };
@@ -135,6 +135,15 @@ pub enum FuelSystemPumpStatus {
     Off = 0,
     On = 1,
     Auto = 2,
+}
+
+impl From<bool> for FuelSystemPumpStatus {
+    fn from(value: bool) -> Self {
+        match value {
+            true => Self::On,
+            false => Self::Off,
+        }
+    }
 }
 
 /// Client events which we are sending to the simulator
@@ -294,8 +303,10 @@ impl SimCommunicator {
     pub fn run(&mut self) {
         loop {
             debug!("Attempting to connect via SimConnect");
-            if let Err(e) = self.connect_and_process() {
-                warn!("{}", e)
+            match self.connect_and_process() {
+                Err(SimError::Connect(e)) => warn!("{}", e),
+                Err(SimError::Runtime(e)) => error!("{}", e),
+                Ok(_) => {}
             };
             // Wait before reconnecting
             std::thread::sleep(Duration::from_secs(5));

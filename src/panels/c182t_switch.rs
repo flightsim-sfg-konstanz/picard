@@ -11,7 +11,6 @@ use std::time::Duration;
 use crate::bitfield::BitField;
 use crate::panel::Panel;
 use crate::panel::PanelError;
-use crate::sim::FuelSystemPumpStatus;
 use crate::sim::SimClientEvent;
 use crate::Event;
 use crate::SimState;
@@ -129,86 +128,63 @@ impl C182TSwitchPanel {
         self.switch_states.update(state);
 
         // Set switch positions in simulator
-        self.switch_states
-            .when_changed(Switch::Alternator, |state| {
-                self.send_sim_event(SimClientEvent::AlternatorSet {
-                    state,
-                    alternator_index: 1,
-                })
-            });
-        self.switch_states.when_changed(Switch::Battery, |state| {
-            self.send_sim_event(SimClientEvent::Battery1Set(state));
+        self.send_sim_event(SimClientEvent::AlternatorSet {
+            state: self.switch_states.is_set(Switch::Alternator),
+            alternator_index: 1,
         });
-        self.switch_states.when_changed(Switch::Avionics1, |state| {
-            self.send_sim_event(SimClientEvent::AvionicsMaster1Set(state));
-        });
-        self.switch_states.when_changed(Switch::Avionics2, |state| {
-            self.send_sim_event(SimClientEvent::AvionicsMaster2Set(state));
-        });
-        self.switch_states
-            .when_changed(Switch::StbyBatteryArm, |state| {
-                self.send_sim_event(SimClientEvent::Battery2Set(!state));
-            });
-        self.switch_states.when_changed(Switch::Beacon, |state| {
-            self.send_sim_event(if !state {
-                SimClientEvent::BeaconLightOn
-            } else {
-                SimClientEvent::BeaconLightOff
-            });
-        });
-        self.switch_states.when_changed(Switch::Nav, |state| {
-            self.send_sim_event(if !state {
-                SimClientEvent::NavLightsOn
-            } else {
-                SimClientEvent::NavLightsOff
-            });
-        });
-        self.switch_states.when_changed(Switch::Strobe, |state| {
-            self.send_sim_event(if !state {
-                SimClientEvent::StrobeLightsOn
-            } else {
-                SimClientEvent::StrobeLightsOff
-            });
-        });
-        if self.switch_states.has_changed(Switch::Taxi)
-            || self.switch_states.has_changed(Switch::Landing)
-        {
-            match (
-                !self.switch_states.is_set(Switch::Taxi),
-                !self.switch_states.is_set(Switch::Landing),
-            ) {
-                (true, true) => {
-                    self.send_sim_event(SimClientEvent::TaxiLightsOn);
-                    self.send_sim_event(SimClientEvent::LandingLightsOn);
-                }
-                (true, false) => {
-                    self.send_sim_event(SimClientEvent::TaxiLightsOff);
-                    self.send_sim_event(SimClientEvent::LandingLightsOff);
-                }
-                (false, true) => {
-                    self.send_sim_event(SimClientEvent::TaxiLightsOn);
-                    self.send_sim_event(SimClientEvent::LandingLightsOn);
-                }
-                (false, false) => {
-                    self.send_sim_event(SimClientEvent::TaxiLightsOn);
-                    self.send_sim_event(SimClientEvent::LandingLightsOff);
-                }
+        self.send_sim_event(SimClientEvent::Battery1Set(
+            self.switch_states.is_set(Switch::Battery),
+        ));
+        self.send_sim_event(SimClientEvent::AvionicsMaster1Set(
+            self.switch_states.is_set(Switch::Avionics1),
+        ));
+        self.send_sim_event(SimClientEvent::AvionicsMaster2Set(
+            self.switch_states.is_set(Switch::Avionics2),
+        ));
+        self.send_sim_event(SimClientEvent::Battery2Set(
+            !self.switch_states.is_set(Switch::StbyBatteryArm),
+        ));
+        match !self.switch_states.is_set(Switch::Beacon) {
+            true => self.send_sim_event(SimClientEvent::BeaconLightOn),
+            false => self.send_sim_event(SimClientEvent::BeaconLightOff),
+        };
+        match !self.switch_states.is_set(Switch::Nav) {
+            true => self.send_sim_event(SimClientEvent::NavLightsOn),
+            false => self.send_sim_event(SimClientEvent::NavLightsOff),
+        };
+        match !self.switch_states.is_set(Switch::Strobe) {
+            true => self.send_sim_event(SimClientEvent::StrobeLightsOn),
+            false => self.send_sim_event(SimClientEvent::StrobeLightsOff),
+        };
+        match (
+            !self.switch_states.is_set(Switch::Taxi),
+            !self.switch_states.is_set(Switch::Landing),
+        ) {
+            (true, true) => {
+                self.send_sim_event(SimClientEvent::TaxiLightsOn);
+                self.send_sim_event(SimClientEvent::LandingLightsOn);
+            }
+            (true, false) => {
+                self.send_sim_event(SimClientEvent::TaxiLightsOff);
+                self.send_sim_event(SimClientEvent::LandingLightsOff);
+            }
+            (false, true) => {
+                self.send_sim_event(SimClientEvent::TaxiLightsOn);
+                self.send_sim_event(SimClientEvent::LandingLightsOn);
+            }
+            (false, false) => {
+                self.send_sim_event(SimClientEvent::TaxiLightsOn);
+                self.send_sim_event(SimClientEvent::LandingLightsOff);
             }
         };
-        self.switch_states.when_changed(Switch::FuelPump, |state| {
-            let pump_status = match !state {
-                true => FuelSystemPumpStatus::On,
-                false => FuelSystemPumpStatus::Off,
-            };
-            self.send_sim_event(SimClientEvent::ElecFuelPump1Set(pump_status));
-        });
-        self.switch_states.when_changed(Switch::PitotHeat, |state| {
-            self.send_sim_event(if !state {
-                SimClientEvent::PitotHeatOn
-            } else {
-                SimClientEvent::PitotHeatOff
-            });
-        });
+        self.send_sim_event(SimClientEvent::ElecFuelPump1Set(
+            (!self.switch_states.is_set(Switch::FuelPump)).into(),
+        ));
+        match !self.switch_states.is_set(Switch::PitotHeat) {
+            true => self.send_sim_event(SimClientEvent::PitotHeatOn),
+            false => self.send_sim_event(SimClientEvent::PitotHeatOff),
+        };
+
         // Send dimmer positions in simulator
         let panel_dimmer = (u8::MAX - data[2]) as f32 / 255.0;
         self.send_sim_event(SimClientEvent::LightPotentiometerSet {
