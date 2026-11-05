@@ -49,8 +49,10 @@ fn run(config: Config) {
 
     // Initialization of C182T switch panel
     if let Some(port) = config.c182t_switch_panel_port() {
-        let panel = C182TSwitchPanel::new(sim_state.clone(), port, hw_tx.clone());
+        let (sim_tx, sim_rx) = mpsc::channel();
+        let panel = C182TSwitchPanel::new(sim_state.clone(), port, hw_tx.clone(), sim_rx);
         panels.push(Box::new(panel));
+        sim_txs.push(sim_tx);
     };
 
     // Start threads

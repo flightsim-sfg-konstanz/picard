@@ -1,12 +1,15 @@
 use std::{
+    collections::HashMap,
+    ffi::CStr,
     fmt::Display,
     sync::{mpsc, Arc, RwLock},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use log::{debug, error, info, warn};
 use simconnect_sdk::{
-    FlxClientEvent, Notification, SimConnect, SimConnectError, SimConnectObject, SystemEvent,
+    FlxClientEvent, InputEvent, Notification, SimConnect, SimConnectError, SimConnectObject,
+    SystemEvent, VariableId,
 };
 
 use crate::Event;
@@ -71,6 +74,11 @@ struct AircraftSimData {
     gear_right_position: f64,
     #[simconnect(name = "AIRSPEED INDICATED", unit = "knots")]
     airspeed: f64,
+    // Electrical outputs of the Cessna T182T realism mod
+    #[simconnect(name = "L:ELEC_STBY_TEST_LAMP", unit = "number")]
+    stby_batt_test_lamp: f64,
+    #[simconnect(name = "L:ELEC_LIGHT_SW_CB_PANELS", unit = "number")]
+    sw_cb_panels_light: f64,
 
     /// Parking brake indicator.
     ///
@@ -87,6 +95,9 @@ pub struct AircraftSimState {
     pub gear_left_state: LandingGearStatus,
     pub gear_right_state: LandingGearStatus,
     pub airspeed: f64,
+    pub stby_batt_test_lamp: bool,
+    /// Brightness of the switch and circuit breaker panel lighting from 0 to 1
+    pub sw_cb_panels_light: f64,
 }
 
 impl From<AircraftSimData> for AircraftSimState {
@@ -97,6 +108,8 @@ impl From<AircraftSimData> for AircraftSimState {
             gear_left_state: value.gear_left_position.into(),
             gear_right_state: value.gear_right_position.into(),
             airspeed: value.airspeed,
+            stby_batt_test_lamp: value.stby_batt_test_lamp != 0.0,
+            sw_cb_panels_light: value.sw_cb_panels_light,
         }
     }
 }
@@ -149,7 +162,7 @@ impl From<bool> for FuelSystemPumpStatus {
 /// Client events which we are sending to the simulator
 ///
 /// This enum starts at a higher number to not cause conflicts with system events defined in the simconnect dependency.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 #[repr(u32)]
 pub enum SimClientEvent {
     AlternatorSet {
@@ -160,6 +173,7 @@ pub enum SimClientEvent {
     Battery2Set(bool),
     AvionicsMaster1Set(bool),
     AvionicsMaster2Set(bool),
+    StbyBatteryTestSet(bool),
     BeaconLightOn,
     BeaconLightOff,
     NavLightsOn,
@@ -175,9 +189,17 @@ pub enum SimClientEvent {
     PitotHeatOff,
     CabinPwrOn,
     CabinPwrOff,
+    PanelLightsSet {
+        state: bool,
+        light_index: u32,
+    },
     PanelLightsPowerSettingSet {
         light_circuit_index: u32,
         power_setting: f32,
+    },
+    PedestalLightsSet {
+        state: bool,
+        light_index: u32,
     },
     PedestalLightsPowerSettingSet {
         light_circuit_index: u32,
@@ -202,41 +224,44 @@ impl FlxClientEvent for SimClientEvent {
         unsafe { *<*const _>::from(self).cast::<u32>() }
     }
 
-    fn event_name(&self) -> *const std::ffi::c_char {
-        (match self {
-            SimClientEvent::AlternatorSet { .. } => "ALTERNATOR_SET\0",
-            SimClientEvent::Battery1Set { .. } => "BATTERY1_SET\0",
-            SimClientEvent::Battery2Set { .. } => "BATTERY2_SET\0",
-            SimClientEvent::AvionicsMaster1Set { .. } => "AVIONICS_MASTER_1_SET\0",
-            SimClientEvent::AvionicsMaster2Set { .. } => "AVIONICS_MASTER_2_Set\0",
-            SimClientEvent::BeaconLightOn => "BEACON_LIGHTS_ON\0",
-            SimClientEvent::BeaconLightOff => "BEACON_LIGHTS_OFF\0",
-            SimClientEvent::NavLightsOn => "NAV_LIGHTS_ON\0",
-            SimClientEvent::NavLightsOff => "NAV_LIGHTS_OFF\0",
-            SimClientEvent::StrobeLightsOn => "STROBES_ON\0",
-            SimClientEvent::StrobeLightsOff => "STROBES_OFF\0",
-            SimClientEvent::TaxiLightsOn => "TAXI_LIGHTS_ON\0",
-            SimClientEvent::TaxiLightsOff => "TAXI_LIGHTS_OFF\0",
-            SimClientEvent::LandingLightsOn => "LANDING_LIGHTS_ON\0",
-            SimClientEvent::LandingLightsOff => "LANDING_LIGHTS_OFF\0",
-            SimClientEvent::ElecFuelPump1Set { .. } => "ELECT_FUEL_PUMP1_SET\0",
-            SimClientEvent::PitotHeatOn => "PITOT_HEAT_ON\0",
-            SimClientEvent::PitotHeatOff => "PITOT_HEAT_OFF\0",
-            SimClientEvent::CabinPwrOn => todo!(),
-            SimClientEvent::CabinPwrOff => todo!(),
-            SimClientEvent::PanelLightsPowerSettingSet { .. } => "PANEL_LIGHTS_POWER_SETTING_SET\0",
+    fn event_name(&self) -> &'static CStr {
+        match self {
+            SimClientEvent::AlternatorSet { .. } => c"ALTERNATOR_SET",
+            SimClientEvent::Battery1Set { .. } => c"BATTERY1_SET",
+            SimClientEvent::Battery2Set { .. } => c"BATTERY2_SET",
+            SimClientEvent::BeaconLightOn => c"BEACON_LIGHTS_ON",
+            SimClientEvent::BeaconLightOff => c"BEACON_LIGHTS_OFF",
+            SimClientEvent::NavLightsOn => c"NAV_LIGHTS_ON",
+            SimClientEvent::NavLightsOff => c"NAV_LIGHTS_OFF",
+            SimClientEvent::StrobeLightsOn => c"STROBES_ON",
+            SimClientEvent::StrobeLightsOff => c"STROBES_OFF",
+            SimClientEvent::TaxiLightsOn => c"TAXI_LIGHTS_ON",
+            SimClientEvent::TaxiLightsOff => c"TAXI_LIGHTS_OFF",
+            SimClientEvent::LandingLightsOn => c"LANDING_LIGHTS_ON",
+            SimClientEvent::LandingLightsOff => c"LANDING_LIGHTS_OFF",
+            SimClientEvent::ElecFuelPump1Set { .. } => c"ELECT_FUEL_PUMP1_SET",
+            SimClientEvent::PitotHeatOn => c"PITOT_HEAT_ON",
+            SimClientEvent::PitotHeatOff => c"PITOT_HEAT_OFF",
+            SimClientEvent::PanelLightsSet { .. } => c"PANEL_LIGHTS_SET",
+            SimClientEvent::PanelLightsPowerSettingSet { .. } => c"PANEL_LIGHTS_POWER_SETTING_SET",
+            SimClientEvent::PedestalLightsSet { .. } => c"PEDESTRAL_LIGHTS_SET",
             SimClientEvent::PedestalLightsPowerSettingSet { .. } => {
-                "PEDESTRAL_LIGHTS_POWER_SETTING_SET\0"
+                c"PEDESTRAL_LIGHTS_POWER_SETTING_SET"
             }
-            SimClientEvent::LightPotentiometerSet { .. } => "LIGHT_POTENTIOMETER_SET\0",
-            SimClientEvent::FlapsUp => "FLAPS_DECR\0",
-            SimClientEvent::FlapsDown => "FLAPS_INCR\0",
-            SimClientEvent::ParkingBrakeOn => "PARKING_BRAKE_SET\0",
-            SimClientEvent::ParkingBrakeOff => "PARKING_BRAKE_SET\0",
-            SimClientEvent::LandingGearUp => "GEAR_UP\0",
-            SimClientEvent::LandingGearDown => "GEAR_DOWN\0",
-        })
-        .as_ptr() as *const std::ffi::c_char
+            SimClientEvent::LightPotentiometerSet { .. } => c"LIGHT_POTENTIOMETER_SET",
+            SimClientEvent::FlapsUp => c"FLAPS_DECR",
+            SimClientEvent::FlapsDown => c"FLAPS_INCR",
+            SimClientEvent::ParkingBrakeOn => c"PARKING_BRAKE_SET",
+            SimClientEvent::ParkingBrakeOff => c"PARKING_BRAKE_SET",
+            SimClientEvent::LandingGearUp => c"GEAR_UP",
+            SimClientEvent::LandingGearDown => c"GEAR_DOWN",
+            // Set as cockpit switches, see `cockpit_switch`
+            SimClientEvent::AvionicsMaster1Set(_)
+            | SimClientEvent::AvionicsMaster2Set(_)
+            | SimClientEvent::StbyBatteryTestSet(_)
+            | SimClientEvent::CabinPwrOn
+            | SimClientEvent::CabinPwrOff => unreachable!(),
+        }
     }
 
     fn data(&self) -> (u32, u32, u32, u32, u32) {
@@ -247,9 +272,10 @@ impl FlxClientEvent for SimClientEvent {
             } => (*state as u32, *alternator_index, 0, 0, 0),
             SimClientEvent::Battery1Set(state) => (*state as u32, 0, 0, 0, 0),
             SimClientEvent::Battery2Set(state) => (*state as u32, 0, 0, 0, 0),
-            SimClientEvent::AvionicsMaster1Set(state) => (*state as u32, 0, 0, 0, 0),
-            SimClientEvent::AvionicsMaster2Set(state) => (*state as u32, 0, 0, 0, 0),
             SimClientEvent::ElecFuelPump1Set(state) => (state.clone() as u32, 0, 0, 0, 0),
+            SimClientEvent::PanelLightsSet { state, light_index } => {
+                (*state as u32, *light_index, 0, 0, 0)
+            }
             SimClientEvent::PanelLightsPowerSettingSet {
                 light_circuit_index,
                 power_setting,
@@ -260,6 +286,9 @@ impl FlxClientEvent for SimClientEvent {
                 0,
                 0,
             ),
+            SimClientEvent::PedestalLightsSet { state, light_index } => {
+                (*state as u32, *light_index, 0, 0, 0)
+            }
             SimClientEvent::PedestalLightsPowerSettingSet {
                 light_circuit_index,
                 power_setting,
@@ -278,6 +307,162 @@ impl FlxClientEvent for SimClientEvent {
             SimClientEvent::ParkingBrakeOff => (0, 0, 0, 0, 0),
             _ => (0, 0, 0, 0, 0),
         }
+    }
+}
+
+impl SimClientEvent {
+    /// Get the cockpit switch and its state if the event is not sent as sim event
+    fn cockpit_switch(&self) -> Option<(CockpitSwitch, bool)> {
+        match self {
+            SimClientEvent::AvionicsMaster1Set(state) => {
+                Some((CockpitSwitch::AvionicsBus1, *state))
+            }
+            SimClientEvent::AvionicsMaster2Set(state) => {
+                Some((CockpitSwitch::AvionicsBus2, *state))
+            }
+            SimClientEvent::StbyBatteryTestSet(state) => {
+                Some((CockpitSwitch::StbyBatteryTest, *state))
+            }
+            SimClientEvent::CabinPwrOn => Some((CockpitSwitch::CabinPower12V, true)),
+            SimClientEvent::CabinPwrOff => Some((CockpitSwitch::CabinPower12V, false)),
+            _ => None,
+        }
+    }
+}
+
+/// Cockpit switches of the T182T mod which cannot be set with a sim event
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum CockpitSwitch {
+    AvionicsBus1,
+    AvionicsBus2,
+    StbyBatteryTest,
+    CabinPower12V,
+}
+
+/// How a cockpit switch is set in the simulator
+enum SwitchTarget {
+    /// The switch follows an `L:` variable
+    Variable(&'static str),
+    /// The switch is set with an input event of the cockpit
+    InputEvent(&'static str),
+}
+
+impl CockpitSwitch {
+    const ALL: [CockpitSwitch; 4] = [
+        CockpitSwitch::AvionicsBus1,
+        CockpitSwitch::AvionicsBus2,
+        CockpitSwitch::StbyBatteryTest,
+        CockpitSwitch::CabinPower12V,
+    ];
+
+    fn target(&self) -> SwitchTarget {
+        match self {
+            // The avionics switches use the avionics bus template of Asobo
+            CockpitSwitch::AvionicsBus1 => SwitchTarget::InputEvent("ELECTRICAL_Avionics_Bus_1"),
+            CockpitSwitch::AvionicsBus2 => SwitchTarget::InputEvent("ELECTRICAL_Avionics_Bus_2"),
+            CockpitSwitch::StbyBatteryTest => SwitchTarget::Variable("L:XMLVAR_STBYBattery_Test"),
+            CockpitSwitch::CabinPower12V => {
+                SwitchTarget::Variable("L:XMLVAR_ELECTRICAL_Switch_Power12V_ON")
+            }
+        }
+    }
+}
+
+/// Minimum time before an input event is set to the same value again
+///
+/// The template of the avionics switches toggles the switch if it differs from the value we set. Setting the value
+/// again before the toggle took effect would toggle the switch back.
+const INPUT_EVENT_REFRESH: Duration = Duration::from_secs(1);
+
+/// Holds what is needed to set the cockpit switches during a SimConnect connection
+#[derive(Default)]
+struct CockpitSwitches {
+    /// The registered `L:` variables of the switches
+    variables: HashMap<CockpitSwitch, VariableId>,
+    /// The input event hashes of the switches in the current flight
+    input_events: HashMap<CockpitSwitch, u64>,
+    /// The last value each input event was set to and when
+    input_events_last_set: HashMap<CockpitSwitch, (bool, Instant)>,
+}
+
+impl CockpitSwitches {
+    /// Register the `L:` variables of the switches
+    fn register_variables(&mut self, client: &mut SimConnect) -> Result<(), SimConnectError> {
+        for switch in CockpitSwitch::ALL {
+            if let SwitchTarget::Variable(name) = switch.target() {
+                let variable = client.register_variable(name, "number")?;
+                self.variables.insert(switch, variable);
+            }
+        }
+        Ok(())
+    }
+
+    /// Store the hashes of the input events of the switches
+    ///
+    /// The simulator lists the input events in multiple parts, `last` is set for the last part.
+    fn add_input_events(&mut self, events: &[InputEvent], last: bool) {
+        for switch in CockpitSwitch::ALL {
+            if let SwitchTarget::InputEvent(name) = switch.target() {
+                if let Some(event) = events.iter().find(|e| e.name.eq_ignore_ascii_case(name)) {
+                    info!("Found input event {} for {:?}", event.name, switch);
+                    self.input_events.insert(switch, event.hash);
+                } else if last && !self.input_events.contains_key(&switch) {
+                    warn!(
+                        "Aircraft has no input event {}, cannot set {:?}",
+                        name, switch
+                    );
+                }
+            }
+        }
+    }
+
+    /// Forget the input events, they are only valid for the current flight
+    fn clear_input_events(&mut self) {
+        self.input_events.clear();
+        self.input_events_last_set.clear();
+    }
+
+    /// Check whether an input event has to be set and remember the value if so
+    ///
+    /// This is the case if the value changed or if the last set is at least `INPUT_EVENT_REFRESH` ago.
+    fn input_event_due(&mut self, switch: CockpitSwitch, state: bool, now: Instant) -> bool {
+        let due = match self.input_events_last_set.get(&switch) {
+            Some(&(last_state, last_time)) => {
+                last_state != state || now.duration_since(last_time) >= INPUT_EVENT_REFRESH
+            }
+            None => true,
+        };
+        if due {
+            self.input_events_last_set.insert(switch, (state, now));
+        }
+        due
+    }
+
+    /// Set a cockpit switch in the simulator
+    ///
+    /// Input events that the simulator has not listed yet are skipped.
+    fn set(
+        &mut self,
+        client: &SimConnect,
+        switch: CockpitSwitch,
+        state: bool,
+    ) -> Result<(), SimConnectError> {
+        let value = if state { 1.0 } else { 0.0 };
+        match switch.target() {
+            SwitchTarget::Variable(_) => {
+                if let Some(&variable) = self.variables.get(&switch) {
+                    client.set_variable(variable, value)?;
+                }
+            }
+            SwitchTarget::InputEvent(_) => {
+                if let Some(&hash) = self.input_events.get(&switch) {
+                    if self.input_event_due(switch, state, Instant::now()) {
+                        client.set_input_event(hash, value)?;
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -326,10 +511,11 @@ impl SimCommunicator {
     }
 
     fn run_event_loop(&mut self, mut client: SimConnect) -> Result<(), SimConnectError> {
+        let mut cockpit_switches = CockpitSwitches::default();
         loop {
             // Loop to process all pending events in the channel at once
             for msg in self.hw_rx.try_iter() {
-                self.process_hw_event(&client, msg)?;
+                self.process_hw_event(&client, &mut cockpit_switches, msg)?;
             }
 
             // Loop to process all pending sim events
@@ -339,6 +525,7 @@ impl SimCommunicator {
                     Notification::Open => {
                         info!("Connection with flight simulator established");
                         Self::register_events(&mut client)?;
+                        cockpit_switches.register_variables(&mut client)?;
                         self.sim_state.write().unwrap().sim_connected = true;
                     }
                     Notification::Quit => {
@@ -349,15 +536,26 @@ impl SimCommunicator {
                     Notification::SystemEvent(SystemEvent::Sim { state }) => {
                         info!("Current simulation state: {}", state);
                         self.sim_state.write().unwrap().sim_running = state;
+                        // The input events depend on the aircraft, so we request them for every flight
+                        cockpit_switches.clear_input_events();
+                        if state {
+                            if let Err(e) = client.enumerate_input_events() {
+                                warn!("Failed to request input events: {}", e);
+                            }
+                        }
+                    }
+                    Notification::InputEventList { events, last } => {
+                        cockpit_switches.add_input_events(&events, last);
                     }
                     Notification::Object(data) => {
                         let aircraft_state = AircraftSimData::try_from(&data)?;
                         debug!("Received SimConnect aircraft state {:?}", aircraft_state);
-                        for sim_tx in &self.sim_txs {
+                        // We drop the panels whose thread has exited
+                        self.sim_txs.retain(|sim_tx| {
                             sim_tx
                                 .send(Event::SetPanel(aircraft_state.clone().into()))
-                                .expect("Failed to send to panel");
-                        }
+                                .is_ok()
+                        });
                     }
                     _ => {}
                 }
@@ -371,10 +569,18 @@ impl SimCommunicator {
     /// Handle the events received from hardware
     ///
     /// Note: hardware is responsible to only issue events when the simulator is running.
-    fn process_hw_event(&self, client: &SimConnect, msg: Event) -> Result<(), SimConnectError> {
+    fn process_hw_event(
+        &self,
+        client: &SimConnect,
+        cockpit_switches: &mut CockpitSwitches,
+        msg: Event,
+    ) -> Result<(), SimConnectError> {
         if let Event::SetSimulator(event) = msg {
             debug!("Sending sim event {:?}", event);
-            client.transmit_event(event)?;
+            match event.cockpit_switch() {
+                Some((switch, state)) => cockpit_switches.set(client, switch, state)?,
+                None => client.transmit_event(event)?,
+            }
         }
         Ok(())
     }
@@ -392,8 +598,6 @@ impl SimCommunicator {
         })?;
         client.map_client_event_to_sim_event(SimClientEvent::Battery1Set(false))?;
         client.map_client_event_to_sim_event(SimClientEvent::Battery2Set(false))?;
-        client.map_client_event_to_sim_event(SimClientEvent::AvionicsMaster1Set(false))?;
-        client.map_client_event_to_sim_event(SimClientEvent::AvionicsMaster2Set(false))?;
         client.map_client_event_to_sim_event(SimClientEvent::BeaconLightOn)?;
         client.map_client_event_to_sim_event(SimClientEvent::BeaconLightOff)?;
         client.map_client_event_to_sim_event(SimClientEvent::NavLightsOn)?;
@@ -409,9 +613,17 @@ impl SimCommunicator {
         ))?;
         client.map_client_event_to_sim_event(SimClientEvent::PitotHeatOn)?;
         client.map_client_event_to_sim_event(SimClientEvent::PitotHeatOff)?;
+        client.map_client_event_to_sim_event(SimClientEvent::PanelLightsSet {
+            state: false,
+            light_index: 0,
+        })?;
         client.map_client_event_to_sim_event(SimClientEvent::PanelLightsPowerSettingSet {
             light_circuit_index: 0,
             power_setting: 0.0,
+        })?;
+        client.map_client_event_to_sim_event(SimClientEvent::PedestalLightsSet {
+            state: false,
+            light_index: 0,
         })?;
         client.map_client_event_to_sim_event(SimClientEvent::PedestalLightsPowerSettingSet {
             light_circuit_index: 0,
@@ -429,5 +641,75 @@ impl SimCommunicator {
         client.map_client_event_to_sim_event(SimClientEvent::LandingGearDown)?;
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn input_events_are_found_in_all_parts() {
+        let mut cockpit_switches = CockpitSwitches::default();
+        let event = |name: &str, hash| InputEvent {
+            name: name.to_owned(),
+            hash,
+        };
+        cockpit_switches.add_input_events(&[event("ELECTRICAL_Avionics_Bus_2", 2)], false);
+        cockpit_switches.add_input_events(
+            &[
+                event("ELECTRICAL_Master_Battery_1", 7),
+                event("electrical_avionics_bus_1", 1),
+            ],
+            true,
+        );
+        let input_events = &cockpit_switches.input_events;
+        assert_eq!(input_events.get(&CockpitSwitch::AvionicsBus1), Some(&1));
+        assert_eq!(input_events.get(&CockpitSwitch::AvionicsBus2), Some(&2));
+        assert_eq!(input_events.len(), 2);
+    }
+
+    #[test]
+    fn input_events_are_set_on_change_and_refreshed() {
+        let mut cockpit_switches = CockpitSwitches::default();
+        let switch = CockpitSwitch::AvionicsBus1;
+        let start = Instant::now();
+        let at = |ms| start + Duration::from_millis(ms);
+        assert!(cockpit_switches.input_event_due(switch, true, at(0)));
+        assert!(!cockpit_switches.input_event_due(switch, true, at(25)));
+        assert!(cockpit_switches.input_event_due(switch, false, at(50)));
+        assert!(!cockpit_switches.input_event_due(switch, false, at(1049)));
+        assert!(cockpit_switches.input_event_due(switch, false, at(1050)));
+        cockpit_switches.clear_input_events();
+        assert!(cockpit_switches.input_event_due(switch, false, at(1075)));
+    }
+
+    #[test]
+    fn input_events_are_cleared() {
+        let mut cockpit_switches = CockpitSwitches::default();
+        let event = InputEvent {
+            name: "ELECTRICAL_Avionics_Bus_1".to_owned(),
+            hash: 1,
+        };
+        cockpit_switches.add_input_events(&[event], true);
+        cockpit_switches.clear_input_events();
+        assert!(cockpit_switches.input_events.is_empty());
+    }
+
+    #[test]
+    fn switch_events_are_set_in_the_cockpit() {
+        assert_eq!(
+            SimClientEvent::AvionicsMaster2Set(true).cockpit_switch(),
+            Some((CockpitSwitch::AvionicsBus2, true))
+        );
+        assert_eq!(
+            SimClientEvent::StbyBatteryTestSet(true).cockpit_switch(),
+            Some((CockpitSwitch::StbyBatteryTest, true))
+        );
+        assert_eq!(
+            SimClientEvent::CabinPwrOff.cockpit_switch(),
+            Some((CockpitSwitch::CabinPower12V, false))
+        );
+        assert_eq!(SimClientEvent::Battery2Set(true).cockpit_switch(), None);
     }
 }
