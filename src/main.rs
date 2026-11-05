@@ -8,6 +8,7 @@ use std::{process, thread};
 use crate::config::Config;
 use crate::panels::airspeedindicator::AirspeedIndicatorPanel;
 use crate::panels::eventsim::EventSimPanel;
+use crate::panels::parking_brake::ParkingBrakePanel;
 
 mod bitfield;
 mod config;
@@ -51,6 +52,14 @@ fn run(config: Config) {
     if let Some(port) = config.c182t_switch_panel_port() {
         let (sim_tx, sim_rx) = mpsc::channel();
         let panel = C182TSwitchPanel::new(sim_state.clone(), port, hw_tx.clone(), sim_rx);
+        panels.push(Box::new(panel));
+        sim_txs.push(sim_tx);
+    };
+
+    // Initialization of parking brake panel
+    if let Some(port) = config.parking_brake_panel_port() {
+        let (sim_tx, sim_rx) = mpsc::channel();
+        let panel = ParkingBrakePanel::new(sim_state.clone(), port, hw_tx.clone(), sim_rx);
         panels.push(Box::new(panel));
         sim_txs.push(sim_tx);
     };

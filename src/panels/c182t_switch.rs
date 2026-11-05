@@ -356,6 +356,8 @@ mod tests {
             gear_left_state: LandingGearStatus::Down,
             gear_right_state: LandingGearStatus::Down,
             airspeed: 0.0,
+            brake_left_position: 0.0,
+            brake_right_position: 0.0,
             stby_batt_test_lamp,
             sw_cb_panels_light,
         };

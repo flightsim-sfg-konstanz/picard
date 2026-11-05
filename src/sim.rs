@@ -74,6 +74,10 @@ struct AircraftSimData {
     gear_right_position: f64,
     #[simconnect(name = "AIRSPEED INDICATED", unit = "knots")]
     airspeed: f64,
+    #[simconnect(name = "BRAKE LEFT POSITION", unit = "percent over 100")]
+    brake_left_position: f64,
+    #[simconnect(name = "BRAKE RIGHT POSITION", unit = "percent over 100")]
+    brake_right_position: f64,
     // Electrical outputs of the Cessna T182T realism mod
     #[simconnect(name = "L:ELEC_STBY_TEST_LAMP", unit = "number")]
     stby_batt_test_lamp: f64,
@@ -95,6 +99,8 @@ pub struct AircraftSimState {
     pub gear_left_state: LandingGearStatus,
     pub gear_right_state: LandingGearStatus,
     pub airspeed: f64,
+    pub brake_left_position: f64,
+    pub brake_right_position: f64,
     pub stby_batt_test_lamp: bool,
     /// Brightness of the switch and circuit breaker panel lighting from 0 to 1
     pub sw_cb_panels_light: f64,
@@ -108,6 +114,8 @@ impl From<AircraftSimData> for AircraftSimState {
             gear_left_state: value.gear_left_position.into(),
             gear_right_state: value.gear_right_position.into(),
             airspeed: value.airspeed,
+            brake_left_position: value.brake_left_position,
+            brake_right_position: value.brake_right_position,
             stby_batt_test_lamp: value.stby_batt_test_lamp != 0.0,
             sw_cb_panels_light: value.sw_cb_panels_light,
         }

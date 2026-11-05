@@ -32,6 +32,12 @@ impl Config {
             .get("airspeedindicator")
             .map(|panel| panel.port.clone())
     }
+
+    pub fn parking_brake_panel_port(&self) -> Option<String> {
+        self.panels
+            .get("parking_brake")
+            .map(|panel| panel.port.clone())
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]

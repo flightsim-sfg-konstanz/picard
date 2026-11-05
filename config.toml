@@ -8,3 +8,6 @@ port = "COM2"
 
 [panels.airspeedindicator]
 port = "COM3"
+
+[panels.parking_brake]
+port = "COM4"
