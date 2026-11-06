@@ -142,17 +142,17 @@ impl C182TSwitchPanel {
 
         // Set switch positions in simulator
         self.send_sim_event(SimClientEvent::AlternatorSet {
-            state: self.switch_states.is_set(Switch::Alternator),
+            state: !self.switch_states.is_set(Switch::Alternator),
             alternator_index: 1,
         });
         self.send_sim_event(SimClientEvent::Battery1Set(
-            self.switch_states.is_set(Switch::Battery),
+            !self.switch_states.is_set(Switch::Battery),
         ));
         self.send_sim_event(SimClientEvent::AvionicsMaster1Set(
-            self.switch_states.is_set(Switch::Avionics1),
+            !self.switch_states.is_set(Switch::Avionics1),
         ));
         self.send_sim_event(SimClientEvent::AvionicsMaster2Set(
-            self.switch_states.is_set(Switch::Avionics2),
+            !self.switch_states.is_set(Switch::Avionics2),
         ));
         self.send_sim_event(SimClientEvent::Battery2Set(
             !self.switch_states.is_set(Switch::StbyBatteryArm),
@@ -302,6 +302,32 @@ mod tests {
         panel.sim_state.write().unwrap().sim_running = false;
         panel.handle_serial_frame(&[0x00, 0x00, 0xff, 0xff, 0xff, 0xff], DATA_LEN);
         assert!(hw_rx.try_iter().next().is_none());
+    }
+
+    #[test]
+    fn master_and_avionics_switches_are_on_while_closed() {
+        let closed = [
+            Switch::Alternator,
+            Switch::Battery,
+            Switch::Avionics1,
+            Switch::Avionics2,
+        ];
+        let events = events_for(&closed, [u8::MAX; 4]);
+        assert!(events.contains(&SimClientEvent::AlternatorSet {
+            state: true,
+            alternator_index: 1,
+        }));
+        assert!(events.contains(&SimClientEvent::Battery1Set(true)));
+        assert!(events.contains(&SimClientEvent::AvionicsMaster1Set(true)));
+        assert!(events.contains(&SimClientEvent::AvionicsMaster2Set(true)));
+        let events = events_for(&[], [u8::MAX; 4]);
+        assert!(events.contains(&SimClientEvent::AlternatorSet {
+            state: false,
+            alternator_index: 1,
+        }));
+        assert!(events.contains(&SimClientEvent::Battery1Set(false)));
+        assert!(events.contains(&SimClientEvent::AvionicsMaster1Set(false)));
+        assert!(events.contains(&SimClientEvent::AvionicsMaster2Set(false)));
     }
 
     #[test]
