@@ -1,0 +1,44 @@
+name: Audit
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: "17 6 * * 1" # weekly, so new advisories surface without a push
+
+permissions: {}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_AUDIT: 0.22.2
+  CARGO_OUTDATED: 0.19.0
+
+jobs:
+  audit:
+    name: Dependency audit
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install stable --profile minimal && rustup default stable
+      - id: tools
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/bin/cargo-audit
+            ~/.cargo/bin/cargo-outdated
+          key: cargo-audit-${{ env.CARGO_AUDIT }}-cargo-outdated-${{ env.CARGO_OUTDATED }}-${{ runner.os }}
+      - if: steps.tools.outputs.cache-hit != 'true'
+        run: cargo install --locked "cargo-audit@$CARGO_AUDIT" "cargo-outdated@$CARGO_OUTDATED"
+      - run: cargo audit
+      - name: Report outdated root dependencies
+        run: |
+          { echo '```'; cargo outdated --workspace --root-deps-only; echo '```'; } | tee -a "$GITHUB_STEP_SUMMARY"

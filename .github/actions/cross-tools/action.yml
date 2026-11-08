@@ -1,0 +1,13 @@
+name: Cross tools
+description: >
+  Installs the tools to cross-build and test picard.exe on a Linux runner.
+  These are the MinGW toolchain with its static winpthreads, libclang for the SimConnect bindings, Wine to run the tests and jq to find SimConnect.dll in the build output.
+
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y --no-install-recommends gcc-mingw-w64-x86-64 libclang-dev wine wine64 jq
+        rustup target add x86_64-pc-windows-gnu

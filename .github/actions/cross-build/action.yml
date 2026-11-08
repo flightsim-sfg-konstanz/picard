@@ -1,0 +1,29 @@
+name: Cross build
+description: >
+  Builds picard for Windows on a Linux runner.
+  The build script of simconnect-sdk copies SimConnect.dll into its output directory and this action returns that directory.
+  The tests need it in WINEPATH and the package takes the DLL from it.
+
+inputs:
+  args:
+    description: Additional arguments for cargo build, for example --release
+    default: ""
+
+outputs:
+  simconnect-dll-dir:
+    description: The directory that contains SimConnect.dll
+    value: ${{ steps.build.outputs.dir }}
+
+runs:
+  using: composite
+  steps:
+    - id: build
+      shell: bash
+      env:
+        ARGS: ${{ inputs.args }}
+      run: |
+        # Build and take the output directory of the simconnect-sdk build script from the build messages
+        dir=$(cargo build --target x86_64-pc-windows-gnu --locked $ARGS --message-format=json-render-diagnostics |
+          jq -r 'select(.reason == "build-script-executed" and (.package_id | contains("#simconnect-sdk@"))).out_dir')
+        # Return the directory to the workflow
+        echo "dir=$dir" >> "$GITHUB_OUTPUT"

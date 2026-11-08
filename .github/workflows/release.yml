@@ -1,0 +1,51 @@
+name: Release
+
+# Builds from a clean toolchain without caches so a poisoned cache can never reach a published artifact.
+on:
+  push:
+    tags: ["v*"]
+
+permissions: {}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  release:
+    name: Publish package
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # create the release and upload the package
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install stable --profile minimal && rustup default stable
+      - uses: $/.github/actions/cross-tools
+      - uses: $/.github/actions/cross-build
+        id: build
+      - name: Test under Wine
+        env:
+          CARGO_TARGET_X86_64_PC_WINDOWS_GNU_RUNNER: wine
+          WINEDEBUG: -all
+          WINEPATH: ${{ steps.build.outputs.simconnect-dll-dir }}
+        run: cargo test --target x86_64-pc-windows-gnu --locked
+      - uses: $/.github/actions/cross-build
+        id: release
+        with:
+          args: --release
+      - name: Package picard.exe
+        env:
+          SIMCONNECT_DLL_DIR: ${{ steps.release.outputs.simconnect-dll-dir }}
+        run: |
+          mkdir -p target/package/picard
+          cp target/x86_64-pc-windows-gnu/release/picard.exe "$SIMCONNECT_DLL_DIR/SimConnect.dll" config.toml target/package/picard/
+      - run: zip -r picard.zip picard
+        working-directory: target/package
+      - run: gh release create "$TAG" --verify-tag --generate-notes target/package/picard.zip
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}

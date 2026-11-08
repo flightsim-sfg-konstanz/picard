@@ -1,0 +1,5 @@
+rules:
+  dependabot-cooldown:
+    config:
+      # Project policy: Dependabot waits 3 days on every update, see dependabot.yml.
+      days: 3
