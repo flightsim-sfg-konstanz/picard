@@ -16,8 +16,7 @@ jobs:
     name: Audit workflows
     runs-on: ubuntu-latest
     permissions:
-      contents: read
-      security-events: write
+      security-events: write # Required for upload-sarif (used by zizmor-action) to upload SARIF files.
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -26,4 +25,3 @@ jobs:
         with:
           collect: all
           persona: pedantic
-          advanced-security: true
