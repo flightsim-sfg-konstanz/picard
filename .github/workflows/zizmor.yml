@@ -27,4 +27,3 @@ jobs:
           collect: all
           persona: pedantic
           advanced-security: true
-          annotations: true
