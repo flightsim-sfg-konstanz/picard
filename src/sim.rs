@@ -351,6 +351,11 @@ enum CockpitSwitch {
 enum SwitchTarget {
     /// The switch follows an `L:` variable
     Variable(&'static str),
+    /// The switch follows an `L:` variable and springs back unless a second one says the pilot holds it
+    MomentaryVariable {
+        switch: &'static str,
+        held: &'static str,
+    },
     /// The switch is set with an input event of the cockpit
     InputEvent(&'static str),
 }
@@ -368,7 +373,11 @@ impl CockpitSwitch {
             // The avionics switches use the avionics bus template of Asobo
             CockpitSwitch::AvionicsBus1 => SwitchTarget::InputEvent("ELECTRICAL_Avionics_Bus_1"),
             CockpitSwitch::AvionicsBus2 => SwitchTarget::InputEvent("ELECTRICAL_Avionics_Bus_2"),
-            CockpitSwitch::StbyBatteryTest => SwitchTarget::Variable("L:XMLVAR_STBYBattery_Test"),
+            // The standby battery template of Asobo releases TEST after 0.1 s unless the mouse holds it
+            CockpitSwitch::StbyBatteryTest => SwitchTarget::MomentaryVariable {
+                switch: "L:XMLVAR_STBYBattery_Test",
+                held: "L:XMLVAR_STBYBattery_IsHeld",
+            },
             CockpitSwitch::CabinPower12V => {
                 SwitchTarget::Variable("L:XMLVAR_ELECTRICAL_Switch_Power12V_ON")
             }
@@ -387,6 +396,8 @@ const INPUT_EVENT_REFRESH: Duration = Duration::from_secs(1);
 struct CockpitSwitches {
     /// The registered `L:` variables of the switches
     variables: HashMap<CockpitSwitch, VariableId>,
+    /// The registered `L:` variables saying a momentary switch is held
+    held_variables: HashMap<CockpitSwitch, VariableId>,
     /// The input event hashes of the switches in the current flight
     input_events: HashMap<CockpitSwitch, u64>,
     /// The last value each input event was set to and when
@@ -397,9 +408,18 @@ impl CockpitSwitches {
     /// Register the `L:` variables of the switches
     fn register_variables(&mut self, client: &mut SimConnect) -> Result<(), SimConnectError> {
         for switch in CockpitSwitch::ALL {
-            if let SwitchTarget::Variable(name) = switch.target() {
-                let variable = client.register_variable(name, "number")?;
-                self.variables.insert(switch, variable);
+            match switch.target() {
+                SwitchTarget::Variable(name) => {
+                    let variable = client.register_variable(name, "number")?;
+                    self.variables.insert(switch, variable);
+                }
+                SwitchTarget::MomentaryVariable { switch: name, held } => {
+                    let variable = client.register_variable(name, "number")?;
+                    self.variables.insert(switch, variable);
+                    let variable = client.register_variable(held, "number")?;
+                    self.held_variables.insert(switch, variable);
+                }
+                SwitchTarget::InputEvent(_) => {}
             }
         }
         Ok(())
@@ -458,6 +478,15 @@ impl CockpitSwitches {
         let value = if state { 1.0 } else { 0.0 };
         match switch.target() {
             SwitchTarget::Variable(_) => {
+                if let Some(&variable) = self.variables.get(&switch) {
+                    client.set_variable(variable, value)?;
+                }
+            }
+            // Hold the switch before moving it, so the cockpit does not release it
+            SwitchTarget::MomentaryVariable { .. } => {
+                if let Some(&held) = self.held_variables.get(&switch) {
+                    client.set_variable(held, value)?;
+                }
                 if let Some(&variable) = self.variables.get(&switch) {
                     client.set_variable(variable, value)?;
                 }
@@ -527,7 +556,17 @@ impl SimCommunicator {
             }
 
             // Loop to process all pending sim events
-            while let Some(notification) = client.get_next_dispatch()? {
+            loop {
+                let notification = match client.get_next_dispatch() {
+                    Ok(Some(notification)) => notification,
+                    Ok(None) => break,
+                    // Log a rejected request and go on with the connection
+                    Err(SimConnectError::SimConnectException(code)) => {
+                        warn!("Simulator rejected request: {}", code);
+                        continue;
+                    }
+                    Err(e) => return Err(e),
+                };
                 debug!("Received notification {:?}", notification);
                 match notification {
                     Notification::Open => {

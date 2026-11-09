@@ -7,6 +7,7 @@ use std::sync::Arc;
 use std::sync::RwLock;
 use std::thread;
 use std::time::Duration;
+use std::time::Instant;
 
 use crate::bitfield::BitField;
 use crate::panel::Panel;
@@ -21,6 +22,16 @@ const BAUD_RATE: u32 = 115200;
 
 /// The number of data bytes in a normal COBS frame
 const DATA_LEN: usize = 6;
+
+/// The interval in which the full panel state is sent to the simulator
+///
+/// Note: in between only the switches and dimmers that moved are sent.
+const REFRESH: Duration = Duration::from_secs(1);
+
+/// The steps a dimmer reading may wander from the last sent one before it is sent again
+///
+/// Note: the readings of a resting knob jitter by one step.
+const DIMMER_DEADBAND: u8 = 1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Switch {
@@ -54,6 +65,8 @@ pub struct C182TSwitchPanel {
     hw_tx: mpsc::Sender<Event>,
     sim_rx: mpsc::Receiver<Event>,
     switch_states: BitField<u16>,
+    dimmers: [u8; 4],
+    last_refresh: Option<Instant>,
     aircraft_sim_state: Option<AircraftSimState>,
 }
 
@@ -90,7 +103,7 @@ impl Panel for C182TSwitchPanel {
             if let Some(frame) = frame_reader.next() {
                 match frame {
                     Ok(mut frame) => match cobs::decode_in_place(&mut frame) {
-                        Ok(data_len) => self.handle_serial_frame(&frame, data_len),
+                        Ok(data_len) => self.handle_serial_frame(&frame, data_len, Instant::now()),
                         Err(e) => warn!("Error decoding COBS frame {:?}", e),
                     },
                     // Ignore timouts
@@ -123,11 +136,14 @@ impl C182TSwitchPanel {
             sim_rx,
             port: port.as_ref().into(),
             switch_states: BitField::new(0),
+            dimmers: [0; 4],
+            last_refresh: None,
             aircraft_sim_state: None,
         }
     }
 
-    fn handle_serial_frame(&mut self, data: &[u8], data_len: usize) {
+    /// Send the moved switches and dimmers of a frame, or all of them with the refresh, to the simulator.
+    fn handle_serial_frame(&mut self, data: &[u8], data_len: usize, now: Instant) {
         if data_len != DATA_LEN {
             warn!(
                 "C182T switch panel command is of unexpected length {}",
@@ -136,113 +152,168 @@ impl C182TSwitchPanel {
             return;
         }
 
+        // Send nothing while the sim is not running and the full state once it runs
+        if !self.sim_state.read().unwrap().sim_running {
+            self.last_refresh = None;
+            return;
+        }
+        let refresh = self
+            .last_refresh
+            .is_none_or(|last| now.duration_since(last) >= REFRESH);
+        if refresh {
+            self.last_refresh = Some(now);
+        }
+
         // Update all switch positions
         let state = u16::from_be_bytes([data[0], data[1]]);
         self.switch_states.update(state);
+        let dimmers = [data[2], data[3], data[4], data[5]];
+        // A switch or dimmer is sent when it moved or with the refresh
+        let due = |switch: Switch| refresh || self.switch_states.has_changed(switch);
+        let dimmers_due: [bool; 4] = std::array::from_fn(|index| {
+            refresh || dimmers[index].abs_diff(self.dimmers[index]) > DIMMER_DEADBAND
+        });
 
         // Set switch positions in simulator
-        self.send_sim_event(SimClientEvent::AlternatorSet {
-            state: !self.switch_states.is_set(Switch::Alternator),
-            alternator_index: 1,
-        });
-        self.send_sim_event(SimClientEvent::Battery1Set(
-            !self.switch_states.is_set(Switch::Battery),
-        ));
-        self.send_sim_event(SimClientEvent::AvionicsMaster1Set(
-            !self.switch_states.is_set(Switch::Avionics1),
-        ));
-        self.send_sim_event(SimClientEvent::AvionicsMaster2Set(
-            !self.switch_states.is_set(Switch::Avionics2),
-        ));
-        self.send_sim_event(SimClientEvent::Battery2Set(
-            !self.switch_states.is_set(Switch::StbyBatteryArm),
-        ));
-        self.send_sim_event(SimClientEvent::StbyBatteryTestSet(
-            !self.switch_states.is_set(Switch::StbyBatteryTest),
-        ));
-        match !self.switch_states.is_set(Switch::Beacon) {
-            true => self.send_sim_event(SimClientEvent::BeaconLightOn),
-            false => self.send_sim_event(SimClientEvent::BeaconLightOff),
-        };
-        match !self.switch_states.is_set(Switch::Nav) {
-            true => self.send_sim_event(SimClientEvent::NavLightsOn),
-            false => self.send_sim_event(SimClientEvent::NavLightsOff),
-        };
-        match !self.switch_states.is_set(Switch::Strobe) {
-            true => self.send_sim_event(SimClientEvent::StrobeLightsOn),
-            false => self.send_sim_event(SimClientEvent::StrobeLightsOff),
-        };
-        match (
-            !self.switch_states.is_set(Switch::Taxi),
-            !self.switch_states.is_set(Switch::Landing),
-        ) {
-            (true, true) => {
-                self.send_sim_event(SimClientEvent::TaxiLightsOn);
-                self.send_sim_event(SimClientEvent::LandingLightsOn);
-            }
-            (true, false) => {
-                self.send_sim_event(SimClientEvent::TaxiLightsOff);
-                self.send_sim_event(SimClientEvent::LandingLightsOff);
-            }
-            (false, true) => {
-                self.send_sim_event(SimClientEvent::TaxiLightsOn);
-                self.send_sim_event(SimClientEvent::LandingLightsOn);
-            }
-            (false, false) => {
-                self.send_sim_event(SimClientEvent::TaxiLightsOn);
-                self.send_sim_event(SimClientEvent::LandingLightsOff);
-            }
-        };
-        self.send_sim_event(SimClientEvent::ElecFuelPump1Set(
-            (!self.switch_states.is_set(Switch::FuelPump)).into(),
-        ));
-        match !self.switch_states.is_set(Switch::PitotHeat) {
-            true => self.send_sim_event(SimClientEvent::PitotHeatOn),
-            false => self.send_sim_event(SimClientEvent::PitotHeatOff),
-        };
-        match !self.switch_states.is_set(Switch::CabinPower12V) {
-            true => self.send_sim_event(SimClientEvent::CabinPwrOn),
-            false => self.send_sim_event(SimClientEvent::CabinPwrOff),
-        };
+        if due(Switch::Alternator) {
+            self.send_sim_event(SimClientEvent::AlternatorSet {
+                state: !self.switch_states.is_set(Switch::Alternator),
+                alternator_index: 1,
+            });
+        }
+        if due(Switch::Battery) {
+            self.send_sim_event(SimClientEvent::Battery1Set(
+                !self.switch_states.is_set(Switch::Battery),
+            ));
+        }
+        if due(Switch::Avionics1) {
+            self.send_sim_event(SimClientEvent::AvionicsMaster1Set(
+                !self.switch_states.is_set(Switch::Avionics1),
+            ));
+        }
+        if due(Switch::Avionics2) {
+            self.send_sim_event(SimClientEvent::AvionicsMaster2Set(
+                !self.switch_states.is_set(Switch::Avionics2),
+            ));
+        }
+        if due(Switch::StbyBatteryArm) {
+            self.send_sim_event(SimClientEvent::Battery2Set(
+                !self.switch_states.is_set(Switch::StbyBatteryArm),
+            ));
+        }
+        if due(Switch::StbyBatteryTest) {
+            self.send_sim_event(SimClientEvent::StbyBatteryTestSet(
+                !self.switch_states.is_set(Switch::StbyBatteryTest),
+            ));
+        }
+        if due(Switch::Beacon) {
+            match !self.switch_states.is_set(Switch::Beacon) {
+                true => self.send_sim_event(SimClientEvent::BeaconLightOn),
+                false => self.send_sim_event(SimClientEvent::BeaconLightOff),
+            };
+        }
+        if due(Switch::Nav) {
+            match !self.switch_states.is_set(Switch::Nav) {
+                true => self.send_sim_event(SimClientEvent::NavLightsOn),
+                false => self.send_sim_event(SimClientEvent::NavLightsOff),
+            };
+        }
+        if due(Switch::Strobe) {
+            match !self.switch_states.is_set(Switch::Strobe) {
+                true => self.send_sim_event(SimClientEvent::StrobeLightsOn),
+                false => self.send_sim_event(SimClientEvent::StrobeLightsOff),
+            };
+        }
+        if due(Switch::Taxi) || due(Switch::Landing) {
+            match (
+                !self.switch_states.is_set(Switch::Taxi),
+                !self.switch_states.is_set(Switch::Landing),
+            ) {
+                (true, true) => {
+                    self.send_sim_event(SimClientEvent::TaxiLightsOn);
+                    self.send_sim_event(SimClientEvent::LandingLightsOn);
+                }
+                (true, false) => {
+                    self.send_sim_event(SimClientEvent::TaxiLightsOff);
+                    self.send_sim_event(SimClientEvent::LandingLightsOff);
+                }
+                (false, true) => {
+                    self.send_sim_event(SimClientEvent::TaxiLightsOn);
+                    self.send_sim_event(SimClientEvent::LandingLightsOn);
+                }
+                (false, false) => {
+                    self.send_sim_event(SimClientEvent::TaxiLightsOn);
+                    self.send_sim_event(SimClientEvent::LandingLightsOff);
+                }
+            };
+        }
+        if due(Switch::FuelPump) {
+            self.send_sim_event(SimClientEvent::ElecFuelPump1Set(
+                (!self.switch_states.is_set(Switch::FuelPump)).into(),
+            ));
+        }
+        if due(Switch::PitotHeat) {
+            match !self.switch_states.is_set(Switch::PitotHeat) {
+                true => self.send_sim_event(SimClientEvent::PitotHeatOn),
+                false => self.send_sim_event(SimClientEvent::PitotHeatOff),
+            };
+        }
+        if due(Switch::CabinPower12V) {
+            match !self.switch_states.is_set(Switch::CabinPower12V) {
+                true => self.send_sim_event(SimClientEvent::CabinPwrOn),
+                false => self.send_sim_event(SimClientEvent::CabinPwrOff),
+            };
+        }
 
-        // Send dimmer positions in simulator
-        let panel_dimmer = (u8::MAX - data[2]) as f32 / 255.0;
-        self.send_sim_event(SimClientEvent::LightPotentiometerSet {
-            index: 3,
-            potentiometer_value: panel_dimmer,
-        });
+        // Send dimmer positions in simulator and remember the sent ones
+        if dimmers_due[0] {
+            let panel_dimmer = (u8::MAX - dimmers[0]) as f32 / 255.0;
+            self.send_sim_event(SimClientEvent::LightPotentiometerSet {
+                index: 3,
+                potentiometer_value: panel_dimmer,
+            });
+            self.dimmers[0] = dimmers[0];
+        }
         // Like the knobs in the cockpit, keep the lights on and only set their power
-        let stby_instrument_dimmer = (u8::MAX - data[3]) as f32 / 255.0;
-        self.send_sim_event(SimClientEvent::PanelLightsSet {
-            state: true,
-            light_index: 1,
-        });
-        self.send_sim_event(SimClientEvent::PanelLightsPowerSettingSet {
-            light_circuit_index: 1,
-            power_setting: stby_instrument_dimmer,
-        });
-        let pedestal_dimmer = (u8::MAX - data[4]) as f32 / 255.0;
-        self.send_sim_event(SimClientEvent::PedestalLightsSet {
-            state: true,
-            light_index: 1,
-        });
-        self.send_sim_event(SimClientEvent::PedestalLightsPowerSettingSet {
-            light_circuit_index: 1,
-            power_setting: pedestal_dimmer,
-        });
-        let avionics_dimmer = (u8::MAX - data[5]) as f32 / 255.0;
-        self.send_sim_event(SimClientEvent::LightPotentiometerSet {
-            index: 4,
-            potentiometer_value: avionics_dimmer,
-        });
+        if dimmers_due[1] {
+            let stby_instrument_dimmer = (u8::MAX - dimmers[1]) as f32 / 255.0;
+            self.send_sim_event(SimClientEvent::PanelLightsSet {
+                state: true,
+                light_index: 1,
+            });
+            self.send_sim_event(SimClientEvent::PanelLightsPowerSettingSet {
+                light_circuit_index: 1,
+                power_setting: stby_instrument_dimmer,
+            });
+            self.dimmers[1] = dimmers[1];
+        }
+        if dimmers_due[2] {
+            let pedestal_dimmer = (u8::MAX - dimmers[2]) as f32 / 255.0;
+            self.send_sim_event(SimClientEvent::PedestalLightsSet {
+                state: true,
+                light_index: 1,
+            });
+            self.send_sim_event(SimClientEvent::PedestalLightsPowerSettingSet {
+                light_circuit_index: 1,
+                power_setting: pedestal_dimmer,
+            });
+            self.dimmers[2] = dimmers[2];
+        }
+        if dimmers_due[3] {
+            let avionics_dimmer = (u8::MAX - dimmers[3]) as f32 / 255.0;
+            self.send_sim_event(SimClientEvent::LightPotentiometerSet {
+                index: 4,
+                potentiometer_value: avionics_dimmer,
+            });
+            self.dimmers[3] = dimmers[3];
+        }
     }
 
+    /// Send an event to the simulator.
     fn send_sim_event(&self, event: SimClientEvent) {
-        if self.sim_state.read().unwrap().sim_running {
-            self.hw_tx
-                .send(Event::SetSimulator(event))
-                .expect("SimConnect thread offline");
-        }
+        self.hw_tx
+            .send(Event::SetSimulator(event))
+            .expect("SimConnect thread offline");
     }
 
     /// Get the STBY BATT TEST lamp state and the backlight PWM duty cycle for the panel
@@ -277,31 +348,135 @@ mod tests {
         (panel, hw_rx)
     }
 
-    /// Get the sim events of a frame with the given switches closed and the dimmers at the given positions
-    fn events_for(closed: &[Switch], dimmers: [u8; 4]) -> Vec<SimClientEvent> {
-        let (mut panel, hw_rx) = running_panel();
+    /// Feed a frame with the given switches closed and dimmer positions and get the sim events it causes
+    fn frame(
+        panel: &mut C182TSwitchPanel,
+        hw_rx: &mpsc::Receiver<Event>,
+        closed: &[Switch],
+        dimmers: [u8; 4],
+        now: Instant,
+    ) -> Vec<SimClientEvent> {
         let state = closed
             .iter()
             .fold(u16::MAX, |state, &switch| state & !u16::from(switch));
         let [high, low] = state.to_be_bytes();
         let [dimmer_1, dimmer_2, dimmer_3, dimmer_4] = dimmers;
         let data = [high, low, dimmer_1, dimmer_2, dimmer_3, dimmer_4];
-        panel.handle_serial_frame(&data, DATA_LEN);
-        let mut events = Vec::new();
-        for event in hw_rx.try_iter() {
-            if let Event::SetSimulator(event) = event {
-                events.push(event);
-            }
-        }
-        events
+        panel.handle_serial_frame(&data, DATA_LEN, now);
+        hw_rx
+            .try_iter()
+            .filter_map(|event| match event {
+                Event::SetSimulator(event) => Some(event),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Get the sim events of the first frame with the given switches closed and the dimmers at the given positions
+    fn events_for(closed: &[Switch], dimmers: [u8; 4]) -> Vec<SimClientEvent> {
+        let (mut panel, hw_rx) = running_panel();
+        frame(&mut panel, &hw_rx, closed, dimmers, Instant::now())
+    }
+
+    /// Get a clock that gives the instant the given milliseconds after now
+    fn clock() -> impl Fn(u64) -> Instant {
+        let start = Instant::now();
+        move |ms| start + Duration::from_millis(ms)
     }
 
     #[test]
     fn no_events_are_sent_while_the_sim_is_not_running() {
         let (mut panel, hw_rx) = running_panel();
         panel.sim_state.write().unwrap().sim_running = false;
-        panel.handle_serial_frame(&[0x00, 0x00, 0xff, 0xff, 0xff, 0xff], DATA_LEN);
-        assert!(hw_rx.try_iter().next().is_none());
+        assert!(frame(&mut panel, &hw_rx, &[], [u8::MAX; 4], Instant::now()).is_empty());
+    }
+
+    #[test]
+    fn only_moved_switches_are_sent_between_refreshes() {
+        let (mut panel, hw_rx) = running_panel();
+        let at = clock();
+        let all = frame(&mut panel, &hw_rx, &[], [u8::MAX; 4], at(0));
+        assert!(all.contains(&SimClientEvent::BeaconLightOff));
+        assert!(all.contains(&SimClientEvent::Battery1Set(false)));
+        assert!(frame(&mut panel, &hw_rx, &[], [u8::MAX; 4], at(25)).is_empty());
+        assert_eq!(
+            frame(&mut panel, &hw_rx, &[Switch::Beacon], [u8::MAX; 4], at(50)),
+            vec![SimClientEvent::BeaconLightOn]
+        );
+        assert_eq!(
+            frame(&mut panel, &hw_rx, &[Switch::Beacon], [u8::MAX; 4], at(999)),
+            vec![]
+        );
+        let refreshed = frame(
+            &mut panel,
+            &hw_rx,
+            &[Switch::Beacon],
+            [u8::MAX; 4],
+            at(1000),
+        );
+        assert_eq!(refreshed.len(), all.len());
+        assert!(refreshed.contains(&SimClientEvent::BeaconLightOn));
+        assert!(refreshed.contains(&SimClientEvent::Battery1Set(false)));
+    }
+
+    #[test]
+    fn only_moved_dimmers_are_sent_between_refreshes() {
+        let (mut panel, hw_rx) = running_panel();
+        let at = clock();
+        frame(&mut panel, &hw_rx, &[], [u8::MAX; 4], at(0));
+        assert_eq!(
+            frame(
+                &mut panel,
+                &hw_rx,
+                &[],
+                [u8::MAX, 0, u8::MAX, u8::MAX],
+                at(25)
+            ),
+            vec![
+                SimClientEvent::PanelLightsSet {
+                    state: true,
+                    light_index: 1,
+                },
+                SimClientEvent::PanelLightsPowerSettingSet {
+                    light_circuit_index: 1,
+                    power_setting: 1.0,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn dimmer_jitter_is_not_sent_but_a_slow_turn_is() {
+        let (mut panel, hw_rx) = running_panel();
+        let at = clock();
+        frame(&mut panel, &hw_rx, &[], [100; 4], at(0));
+        // One step of jitter around the sent reading
+        assert!(frame(&mut panel, &hw_rx, &[], [101, 99, 100, 100], at(25)).is_empty());
+        assert!(frame(&mut panel, &hw_rx, &[], [100; 4], at(50)).is_empty());
+        // The second step of a slow turn is sent and becomes the new reference
+        let events = frame(&mut panel, &hw_rx, &[], [102, 100, 100, 100], at(75));
+        assert_eq!(
+            events,
+            vec![SimClientEvent::LightPotentiometerSet {
+                index: 3,
+                potentiometer_value: (u8::MAX - 102) as f32 / 255.0,
+            }]
+        );
+        assert!(frame(&mut panel, &hw_rx, &[], [103, 100, 100, 100], at(100)).is_empty());
+    }
+
+    #[test]
+    fn full_state_is_sent_when_the_sim_starts_running() {
+        let (mut panel, hw_rx) = running_panel();
+        let at = clock();
+        let all = frame(&mut panel, &hw_rx, &[], [u8::MAX; 4], at(0));
+        panel.sim_state.write().unwrap().sim_running = false;
+        assert!(frame(&mut panel, &hw_rx, &[], [u8::MAX; 4], at(25)).is_empty());
+        panel.sim_state.write().unwrap().sim_running = true;
+        assert_eq!(
+            frame(&mut panel, &hw_rx, &[], [u8::MAX; 4], at(50)).len(),
+            all.len()
+        );
     }
 
     #[test]
